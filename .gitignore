@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+.venv/
+venv/
+
+# PyInstaller / 构建产物
+build/
+dist/
+packages/
+
+# 运行时数据与日志
+log/
+data/
+*.log
+device.ini
+
+# 安装包成品（可重新封装）
+Release/Output/
+Release/SoftSetupCore/SetupScripts/app.7z
+Release/SoftSetupCore/SetupScripts/runtime/skin.zip
+
+# 无关安装包
+rustup-init.exe
+rustup-init.sh
+VC_redist.x86.exe
+
+# 编辑器
+.idea/
+.vscode/
+*.swp

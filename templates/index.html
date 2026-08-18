@@ -1,0 +1,209 @@
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <meta charset="utf-8"/>
+    <title>工厂控制端 - Dashboard</title>
+    <style>
+    body { font-family: Arial; margin: 20px; }
+    h2 { color:#333; }
+    fieldset { margin-top:20px; padding:10px; }
+    .log-container { height:300px; overflow-y:scroll; margin-top:10px; }
+    table { border-collapse:collapse; width:100%; table-layout:fixed; }
+    th, td { border:1px solid #ccc; padding:6px; text-align:center; word-break:break-all; }
+    th { background:#f2f2f2; }
+    tr:nth-child(even){background:#f9f9f9;}
+    .ok{color:green;font-weight:bold;}
+    .fail{color:red;font-weight:bold;}
+    .progress{color:orange;font-weight:bold;}
+    .class-header, .sub-header { cursor:pointer; }
+    .sub-container, .machine-container { margin-left:20px; }
+    </style>
+    </head>
+    <body>
+    <h2>工厂控制端 - Dashboard</h2>
+
+    <fieldset>
+    <legend>客户端管理</legend>
+    <form method="post" id="task_form">
+
+    {% set classes = {} %}
+    {% for m in agents_status.keys() %}
+        {% set parts = m.split('-') %}
+        {% if parts[0] not in classes %}
+            {% set _ = classes.update({parts[0]: {}}) %}
+        {% endif %}
+        {% if parts[1] not in classes[parts[0]] %}
+            {% set _ = classes[parts[0]].update({parts[1]: []}) %}
+        {% endif %}
+        {% set _ = classes[parts[0]][parts[1]].append(m) %}
+    {% endfor %}
+
+    {% for cls, subs in classes.items() %}
+    <div>
+    <input type="checkbox" class="class_chk" data-class="{{ cls }}"> <b class="class-header">{{ cls }}</b>
+    <div class="sub-container" style="display:none;">
+        {% for sub, machines in subs.items() %}
+        <div>
+            <input type="checkbox" class="sub_chk" data-class="{{ cls }}" value="{{ sub }}"> <span class="sub-header">{{ sub }}</span>
+            <div class="machine-container" data-class="{{ cls }}" data-sub="{{ sub }}" style="display:none;">
+                {% for m in machines %}
+                <input type="checkbox" class="machine_chk" data-class="{{ cls }}" data-sub="{{ sub }}" name="machines" value="{{ m }}"> {{ m }} ({{ '在线' if (time.time() - agents_status[m]['last_seen']) < 20 else '离线' }})<br/>
+                {% endfor %}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    </div>
+    {% endfor %}
+
+    <br/>
+    <label>任务类型:</label>
+    <select name="action">
+    <option value="deploy_folder">复制文件/文件夹</option>
+    <option value="run_command">执行命令</option>
+    </select><br/><br/>
+
+    <label>公盘路径:</label>
+    <input type="text" name="source" style="width:500px;"
+           value="\\\\192.168.36.248\\test\\ATA"><br/><br/>
+    <label>目标路径:</label>
+    <input type="text" name="destination" style="width:500px;"
+           value="D:\\TE"><br/><br/>
+    <label>模式:</label>
+    <select name="mode">
+    <option value="overwrite">覆盖</option>
+    <option value="mirror">镜像</option>
+    </select><br/><br/>
+    <label>远程cmd命令:</label>
+    <input type="text" name="command" style="width:500px;"
+           value='start "" "D:\TE\填写exe路径"'><br/><br/>
+    <button type="submit">下发任务</button>
+    <button type="submit" name="clear_logs" value="1">清理日志</button>
+    </form>
+    </fieldset>
+
+    <h3>执行日志（最新日志最上面）</h3>
+    <div class="log-container">
+    <table>
+    <colgroup>
+    <col style="width:200px;">
+    <col style="width:200px;">
+    <col style="width:100px;">
+    <col style="width:100px;">
+    <col style="width:calc(100% - 600px);">
+    </colgroup>
+    <thead>
+    <tr><th>时间</th><th>机器</th><th>状态</th><th>进度</th><th>信息</th></tr>
+    </thead>
+    <tbody id="results_body">
+    {% for r in results|reverse %}
+    <tr>
+    <td>{{ r.time }}</td>
+    <td>{{ r.machine }}</td>
+    <td class="{{ 'ok' if r.status=='success' else ('fail' if r.status=='error' else 'progress') }}">{{ r.status }}</td>
+    <td>{{ r.progress if r.progress is defined else '' }}</td>
+    <td>{{ r.message }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+    </table>
+    </div>
+
+    <script>
+    // 折叠大类
+    document.querySelectorAll('.class-header').forEach(h=>{
+        h.addEventListener('click', function(){
+            const subDiv = this.parentElement.querySelector('.sub-container');
+            if(subDiv) subDiv.style.display = subDiv.style.display==='none'?'block':'none';
+        });
+    });
+    // 折叠次级
+    document.querySelectorAll('.sub-header').forEach(h=>{
+        h.addEventListener('click', function(){
+            const mDiv = this.parentElement.querySelector('.machine-container');
+            if(mDiv) mDiv.style.display = mDiv.style.display==='none'?'block':'none';
+        });
+    });
+
+    // 大类勾选控制次级和机器
+    document.querySelectorAll('.class_chk').forEach(cls=>{
+        cls.addEventListener('change', function(){
+            const cls_val = this.dataset.class;
+            const checked = this.checked;
+            document.querySelectorAll(`.sub_chk[data-class='${cls_val}'], .machine_chk[data-class='${cls_val}']`).forEach(el=>{
+                el.checked = checked; el.indeterminate=false;
+            });
+        });
+    });
+
+    // 次级勾选控制机器
+    document.querySelectorAll('.sub_chk').forEach(sub=>{
+        sub.addEventListener('change', function(){
+            const cls_val = this.dataset.class;
+            const sub_val = this.value;
+            const checked = this.checked;
+            document.querySelectorAll(`.machine_chk[data-class='${cls_val}'][data-sub='${sub_val}']`).forEach(m=>{m.checked=checked; m.indeterminate=false;});
+            updateClassState(cls_val);
+        });
+    });
+
+    // 机器勾选更新次级和大类
+    document.querySelectorAll('.machine_chk').forEach(m=>{
+        m.addEventListener('change', function(){
+            const cls_val = this.dataset.class;
+            const sub_val = this.dataset.sub;
+            updateSubState(cls_val, sub_val);
+            updateClassState(cls_val);
+        });
+    });
+
+    function updateSubState(cls_val, sub_val){
+        const machines = document.querySelectorAll(`.machine_chk[data-class='${cls_val}'][data-sub='${sub_val}']`);
+        const sub = document.querySelector(`.sub_chk[data-class='${cls_val}'][value='${sub_val}']`);
+        if(!sub) return;
+        const checkedCount = Array.from(machines).filter(m=>m.checked).length;
+        if(checkedCount===machines.length) sub.checked=true,sub.indeterminate=false;
+        else if(checkedCount===0) sub.checked=false,sub.indeterminate=false;
+        else sub.checked=false,sub.indeterminate=true;
+    }
+
+    function updateClassState(cls_val){
+        const subs = document.querySelectorAll(`.sub_chk[data-class='${cls_val}']`);
+        const cls = document.querySelector(`.class_chk[data-class='${cls_val}']`);
+        if(!cls) return;
+        const checkedCount = Array.from(subs).filter(s=>s.checked).length;
+        const indeterminateCount = Array.from(subs).filter(s=>s.indeterminate).length;
+        if(checkedCount===subs.length) cls.checked=true,cls.indeterminate=false;
+        else if(checkedCount===0 && indeterminateCount===0) cls.checked=false,cls.indeterminate=false;
+        else cls.checked=false,cls.indeterminate=true;
+    }
+
+    // 自动刷新日志
+    function fetchResults(){
+        fetch("/results_json")
+        .then(res=>res.json())
+        .then(data=>{
+            const tbody=document.querySelector("#results_body");
+            tbody.innerHTML="";
+            data.slice().reverse().forEach(r=>{
+                const tr=document.createElement("tr");
+                const statusClass=r.status=='success'?'ok':(r.status=='error'?'fail':'progress');
+                const progressText = r.status=='success' ? '已完成' : 
+                         (r.status=='progress' && r.progress!=undefined ? r.progress+'%' : '');
+                tr.innerHTML=`
+                    <td>${r.time}</td>
+                    <td>${r.machine}</td>
+                    <td class="${statusClass}">${r.status}</td>
+                    <td>${progressText}</td>
+                    <td>${r.message}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+        });
+    }
+    setInterval(fetchResults,2000);
+    window.onload=fetchResults;
+    </script>
+
+    </body>
+    </html>
