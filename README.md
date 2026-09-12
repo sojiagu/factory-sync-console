@@ -1,5 +1,7 @@
 # 工厂同步控制台
 
+**四川酷赛科技有限公司** · By like 开发开放
+
 局域网工厂机台控制与同步工具：网页控制端下发任务，机台 Agent 拉取执行。支持 Win7 / Win10，可网页推送自升级，也可打 NSIS 手工安装包。
 
 > **只适合可信内网。** 控制端没有登录鉴权，Agent 以管理员运行，可搜磁盘、拷文件、执行命令。不要暴露到公网。
@@ -221,5 +223,7 @@ NSIS\makensis.exe SetupScripts\runtime\setup.nsi
 ## 许可证
 
 MIT。见 [LICENSE](LICENSE)。
+
+本项目由 **四川酷赛科技有限公司** 开放，By like 开发。
 
 `Release/SoftSetupCore` 里的 NSIS、皮肤插件、7-Zip 等是第三方工具，按各自原许可证使用。
