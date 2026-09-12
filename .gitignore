@@ -10,6 +10,7 @@ venv/
 build/
 dist/
 packages/
+_win7_wheels/
 
 # 运行时数据与日志
 log/
@@ -17,10 +18,12 @@ data/
 *.log
 device.ini
 
-# 安装包成品（可重新封装）
+# 安装包成品与拷贝进去的运行时（可重新封装）
 Release/Output/
+Release/SoftSetupCore/FilesToInstall/
 Release/SoftSetupCore/SetupScripts/app.7z
 Release/SoftSetupCore/SetupScripts/runtime/skin.zip
+*.res
 
 # 无关安装包
 rustup-init.exe

@@ -16,6 +16,7 @@ a = Analysis(
         'requests',
         'urllib3',
         'tkinter',
+        'mftparser',
     ],
     hookspath=[],
     hooksconfig={},
@@ -46,6 +47,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon='icon.ico',
+    uac_admin=True,
 )
 
 coll = COLLECT(

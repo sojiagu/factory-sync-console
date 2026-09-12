@@ -14,6 +14,7 @@ import hashlib
 import zipfile
 import shutil
 import re
+from urllib.parse import quote
 import tkinter as tk
 from tkinter import messagebox
 
@@ -60,7 +61,11 @@ AUDIT_DIR = os.path.join(LOG_DIR, "audit")
 PACKAGE_DIR = os.path.join(BASE_DIR, "packages")
 SCREENSHOT_DIR = os.path.join(DATA_DIR, "screenshots")
 AGENT_LOG_DIR = os.path.join(DATA_DIR, "agent_logs")
+AGENT_FILE_DIR = os.path.join(DATA_DIR, "agent_files")
 LIGHT_ACTIONS = frozenset({"fetch_logs"})
+COLLECT_MAX_BYTES = 80 * 1024 * 1024
+DRIVE_RE = re.compile(r"^[A-Za-z]:$")
+LOCAL_ABS_RE = re.compile(r"^[A-Za-z]:\\")
 WEB_LOG_KEEP_DAYS = 90
 ONLINE_THRESHOLD = 20
 MAX_RESULTS = 2000
@@ -292,6 +297,111 @@ def normalize_win_dest(path):
         return os.path.normpath(p)
     except Exception:
         return p
+
+
+def normalize_search_drive(drive):
+    d = (drive or "").strip().upper().replace("/", "\\").rstrip("\\")
+    if len(d) == 1 and d.isalpha():
+        d += ":"
+    if DRIVE_RE.match(d):
+        return d
+    return ""
+
+
+def parse_search_drives(raw):
+    if isinstance(raw, (list, tuple)):
+        parts = [str(x or "").strip() for x in raw if str(x or "").strip()]
+        raw = ",".join(parts)
+    s = (raw or "").strip()
+    if not s:
+        return "D:"
+    tokens = [p.strip() for p in re.split(r"[,;\s]+", s) if p.strip()]
+    if any(t.lower() in ("all", "*", "全部") for t in tokens):
+        return "all"
+    out = []
+    for t in tokens:
+        d = normalize_search_drive(t)
+        if d and d not in out:
+            out.append(d)
+    return ",".join(out)
+
+
+def first_search_drive(drive):
+    d = normalize_search_drive(drive)
+    if d:
+        return d
+    m = re.search(r"([A-Za-z]):", drive or "")
+    if m:
+        return m.group(1).upper() + ":"
+    return ""
+
+
+_KW_SPLIT_RE = re.compile(r"[,;\s\u3000\uff0c\u3001]+")
+
+
+def parse_search_keywords(raw, limit=20):
+    seen = set()
+    out = []
+    for part in _KW_SPLIT_RE.split(raw or ""):
+        w = part.strip().strip('"').strip("'")
+        if len(w) < 2:
+            continue
+        key = w.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(w)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def parse_max_hits(raw, default=200):
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        n = default
+    return max(1, min(500, n))
+
+
+def abs_local_hit_path(path, drive=""):
+    p = (path or "").strip().strip('"').strip("'").replace("/", "\\")
+    if not p or p.startswith("\\\\"):
+        return ""
+    if LOCAL_ABS_RE.match(p):
+        return normalize_win_dest(p)
+    d = first_search_drive(drive)
+    if not d:
+        return ""
+    if p.startswith("\\"):
+        return normalize_win_dest(d + p)
+    return normalize_win_dest(d + "\\" + p)
+
+
+def valid_collect_path(path, drive=""):
+    p = abs_local_hit_path(path, drive) or normalize_win_dest(path)
+    if not p or p.startswith("\\\\"):
+        return ""
+    if not LOCAL_ABS_RE.match(p):
+        return ""
+    if len(p) <= 3:
+        return ""
+    return p
+
+
+def agent_file_dir(machine):
+    return os.path.join(AGENT_FILE_DIR, safe_machine_filename(machine))
+
+
+def safe_stored_filename(name):
+    base = os.path.basename(name or "") or "file"
+    base = re.sub(r"[^\w.\-\u4e00-\u9fff]+", "_", base, flags=re.U)
+    if not base or base in (".", ".."):
+        base = "file"
+    if len(base) > 120:
+        root, ext = os.path.splitext(base)
+        base = root[:100] + ext[:20]
+    return base or "file"
 
 
 def under_share(path):
@@ -607,6 +717,27 @@ def _relocate_agent_logs(old_name, new_name):
         pass
 
 
+def _relocate_agent_files(old_name, new_name):
+    old_d = agent_file_dir(old_name)
+    new_d = agent_file_dir(new_name)
+    if old_d == new_d or not os.path.isdir(old_d):
+        return
+    try:
+        if not os.path.isdir(new_d):
+            os.replace(old_d, new_d)
+            return
+        for name in os.listdir(old_d):
+            src = os.path.join(old_d, name)
+            dst = os.path.join(new_d, name)
+            if os.path.isfile(src):
+                if os.path.isfile(dst):
+                    os.remove(dst)
+                os.replace(src, dst)
+        shutil.rmtree(old_d, ignore_errors=True)
+    except Exception:
+        pass
+
+
 def rename_machine_record(old_name, new_name):
     """调用方需已持有 lock。"""
     old_name = (old_name or "").strip()
@@ -634,6 +765,7 @@ def rename_machine_record(old_name, new_name):
         cancel_by_machine[new_name] = cancel_by_machine.pop(old_name)
     _relocate_screenshot_files(old_name, new_name)
     _relocate_agent_logs(old_name, new_name)
+    _relocate_agent_files(old_name, new_name)
 
 
 def delete_machine_record(machine):
@@ -651,6 +783,7 @@ def delete_machine_record(machine):
         except Exception:
             pass
     shutil.rmtree(agent_log_dir(machine), ignore_errors=True)
+    shutil.rmtree(agent_file_dir(machine), ignore_errors=True)
 
 
 def enqueue_machine_task(machine, task_data, message="任务已下发，等待执行...", batch_id=None):
@@ -679,6 +812,10 @@ def enqueue_machine_task(machine, task_data, message="任务已下发，等待�
         "progress": 0,
         "start_ts": now_ts,
         "start_time": now_str,
+        "action": task_data.get("action") or "",
+        "collect_path": task_data.get("path") or "",
+        "keyword": task_data.get("keyword") or "",
+        "drive": task_data.get("drive") or "",
     })
     if len(results) > MAX_RESULTS:
         del results[:-MAX_RESULTS]
@@ -880,6 +1017,19 @@ def format_duration(sec):
     return f"{h}小时{m}分{s}秒"
 
 
+def normalize_result_hits(row):
+    hits = (row or {}).get("hits")
+    drive = (row or {}).get("drive") or ""
+    if not isinstance(hits, list):
+        return
+    for h in hits:
+        if not isinstance(h, dict):
+            continue
+        fixed = abs_local_hit_path(h.get("path") or "", drive)
+        if fixed:
+            h["path"] = fixed
+
+
 def apply_report_timing(existing, data):
     """耗时优先用 Agent 实测 elapsed_sec（纯复制时间），避免回传延迟把几秒显示成几十秒。"""
     now_ts = time.time()
@@ -990,6 +1140,7 @@ def agents_snapshot():
                 "busy": machine_busy,
                 "ip": st.get("ip") or "",
                 "version": st.get("version") or "",
+                "os": st.get("os") or "",
             })
         return {
             "now": now,
@@ -1163,6 +1314,7 @@ def get_task():
     ip = (request.args.get("ip") or "").strip()
     ver = (request.args.get("ver") or "").strip()
     incoming_id = (request.args.get("agent_id") or "").strip()
+    os_tag = (request.args.get("os") or "").strip().lower()
     heartbeat_only = (request.args.get("busy") or "").strip().lower() in ("1", "true", "yes")
     now = time.time()
     with lock:
@@ -1191,6 +1343,8 @@ def get_task():
             agents_status[machine]["version"] = ver
         if incoming_id:
             agents_status[machine]["agent_id"] = incoming_id
+        if os_tag in ("win7", "win10"):
+            agents_status[machine]["os"] = os_tag
         task = pop_next_task(machine, heartbeat_only=heartbeat_only)
         assigned = machine
     if task is not None:
@@ -1236,6 +1390,7 @@ def report_result():
                         data["message"] = "任务已取消"
                     incoming = "cancelled"
                 apply_report_timing(r, data)
+                normalize_result_hits(r)
                 if incoming in ("success", "error", "cancelled"):
                     r.pop("cancel_requested", None)
                     clear_cancel_request(r.get("machine"), task_id)
@@ -1253,6 +1408,7 @@ def report_result():
                 data["duration_text"] = "0秒"
                 data["end_time"] = data["time"]
             results.append(data)
+            normalize_result_hits(data)
         machine = data.get("machine")
         if machine:
             st = agents_status.setdefault(machine, {"last_seen": time.time()})
@@ -1276,6 +1432,8 @@ def report_result():
 def results_json():
     fail_stale_progress()
     with lock:
+        for row in results:
+            normalize_result_hits(row)
         return jsonify(list(results))
 
 
@@ -1620,6 +1778,113 @@ def agent_log_get(machine):
     })
 
 
+def _enqueue_collect_file(machine, path, batch_id=None):
+    """调用方需已持有 lock。"""
+    task_id = enqueue_machine_task(
+        machine,
+        {"action": "collect_file", "machines": [machine], "path": path},
+        message="正在回传文件...",
+        batch_id=batch_id,
+    )
+    return task_id
+
+
+@app.route("/api/collect_file", methods=["POST"])
+def api_collect_file():
+    data = request.get_json(force=True, silent=True) or {}
+    machine = (data.get("machine") or "").strip()
+    path = valid_collect_path(data.get("path") or "", data.get("drive") or "")
+    if not machine:
+        return jsonify({"ok": False, "error": "未指定机台"}), 400
+    if not path:
+        return jsonify({"ok": False, "error": "路径无效：只接受本地盘绝对路径（如 D:\\TE\\a.txt）"}), 400
+    with lock:
+        if not machine_online(machine):
+            return jsonify({"ok": False, "error": "机台不在线"}), 400
+        task_id = _enqueue_collect_file(machine, path)
+    save_state()
+    audit_log("COLLECT_FILE", "dispatch machine=%s path=%s task_id=%s" % (machine, path, task_id))
+    return jsonify({"ok": True, "task_id": task_id, "machine": machine, "path": path})
+
+
+@app.route("/agent/file", methods=["POST"])
+def agent_file_upload():
+    task_id = (request.form.get("task_id") or "").strip()
+    machine = (request.form.get("machine") or "").strip()
+    src_path = valid_collect_path(request.form.get("path") or "")
+    orig_name = (request.form.get("name") or "").strip()
+    f = request.files.get("file")
+    if not task_id or not machine or not f:
+        return jsonify({"ok": False, "error": "缺少 task_id/machine/file"}), 400
+    clen = request.content_length
+    if clen and clen > COLLECT_MAX_BYTES + 2 * 1024 * 1024:
+        return jsonify({"ok": False, "error": "文件超过 %dMB 上限" % (COLLECT_MAX_BYTES // (1024 * 1024))}), 413
+    if not orig_name:
+        orig_name = os.path.basename(src_path) or f.filename or "file"
+    stored = "%s_%s" % (re.sub(r"[^A-Za-z0-9]", "", task_id)[:8] or "file", safe_stored_filename(orig_name))
+    folder = agent_file_dir(machine)
+    os.makedirs(folder, exist_ok=True)
+    dest = os.path.join(folder, stored)
+    tmp = dest + ".uploading"
+    try:
+        f.save(tmp)
+        size = os.path.getsize(tmp)
+        if size > COLLECT_MAX_BYTES:
+            os.remove(tmp)
+            return jsonify({"ok": False, "error": "文件超过 %dMB 上限" % (COLLECT_MAX_BYTES // (1024 * 1024))}), 413
+        os.replace(tmp, dest)
+    except Exception as e:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return jsonify({"ok": False, "error": str(e)}), 500
+    file_url = "/agent_file/%s/%s" % (quote(machine, safe=""), quote(stored, safe=""))
+    if orig_name:
+        file_url += "?name=" + quote(orig_name, safe="")
+    with lock:
+        for r in results:
+            if r.get("task_id") == task_id:
+                r["file_url"] = file_url
+                r["file_name"] = orig_name
+                r["file_size"] = size
+                r["stored_name"] = stored
+                if src_path:
+                    r["collect_path"] = src_path
+                st = agents_status.setdefault(machine, {"last_seen": time.time()})
+                st["last_seen"] = time.time()
+                break
+    save_state()
+    audit_log(
+        "COLLECT_FILE",
+        "upload machine=%s path=%s size=%s stored=%s task_id=%s" % (machine, src_path or orig_name, size, stored, task_id),
+    )
+    return jsonify({
+        "ok": True,
+        "file_url": file_url,
+        "file_name": orig_name,
+        "file_size": size,
+        "stored_name": stored,
+    })
+
+
+@app.route("/agent_file/<machine>/<filename>")
+def agent_file_get(machine, filename):
+    if not machine or not filename:
+        return jsonify({"ok": False, "error": "参数无效"}), 400
+    if "/" in filename or "\\" in filename or filename in (".", ".."):
+        return jsonify({"ok": False, "error": "文件名无效"}), 400
+    folder = agent_file_dir(machine)
+    path = os.path.abspath(os.path.join(folder, filename))
+    root = os.path.abspath(folder)
+    if not path.startswith(root + os.sep) or not os.path.isfile(path):
+        return jsonify({"ok": False, "error": "文件不存在"}), 404
+    download_name = (request.args.get("name") or "").strip() or filename
+    download_name = os.path.basename(download_name) or filename
+    return send_from_directory(folder, filename, as_attachment=True, download_name=download_name)
+
+
 @app.route("/rdp/<machine>")
 def rdp_file(machine):
     with lock:
@@ -1703,19 +1968,30 @@ def agent_package_upload():
         f.save(tmp)
         with zipfile.ZipFile(tmp, "r") as zf:
             names = zf.namelist()
-        joined = "\n".join(names).replace("\\", "/").lower()
-        if "agent.exe" not in joined:
+        joined = "\n".join(n.replace("\\", "/").lower() for n in names)
+        has_exe = "agent.exe" in joined
+        has_internal = any(
+            n.replace("\\", "/").rstrip("/").lower().endswith("_internal")
+            or "/_internal/" in n.replace("\\", "/").lower()
+            for n in names
+        )
+        has_win10 = "win10/_internal/" in joined or joined.endswith("win10/_internal")
+        has_win7 = "win7/_internal/" in joined or joined.endswith("win7/_internal")
+        # 兼容布局：_internal/win10/_internal 与顶层 win10/_internal 都能过
+        looks_bundle = "win10/" in joined or "win7/" in joined
+        has_mftscan = any(n.replace("\\", "/").lower().endswith("/mftscan.exe") or n.lower() == "mftscan.exe" for n in names)
+        if not has_exe:
             os.remove(tmp)
             return jsonify({"ok": False, "error": "zip 内未找到 agent.exe"}), 400
-        if "_internal/" not in joined and "_internal\\" not in "\n".join(names):
-            # still accept if folder exists as _internal/
-            has_internal = any(
-                n.replace("\\", "/").rstrip("/").endswith("_internal") or "/_internal/" in n.replace("\\", "/")
-                for n in names
-            )
-            if not has_internal:
-                os.remove(tmp)
-                return jsonify({"ok": False, "error": "zip 内未找到 _internal（分离式安装需要）"}), 400
+        if has_mftscan:
+            os.remove(tmp)
+            return jsonify({"ok": False, "error": "升级包含 mftscan.exe，请用当前不含独立扫描 exe 的统一包"}), 400
+        if looks_bundle and not (has_win10 and has_win7):
+            os.remove(tmp)
+            return jsonify({"ok": False, "error": "统一包需同时包含 win10 与 win7 运行时"}), 400
+        if not has_internal:
+            os.remove(tmp)
+            return jsonify({"ok": False, "error": "zip 内未找到 _internal（需统一包或旧版 onedir）"}), 400
         os.replace(tmp, zip_path)
         digest = sha256_file(zip_path)
         meta = {
@@ -1723,6 +1999,7 @@ def agent_package_upload():
             "sha256": digest,
             "size": os.path.getsize(zip_path),
             "notes": notes,
+            "os": "any" if has_win10 and has_win7 else "legacy",
             "uploaded": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         with open(meta_path, "w", encoding="utf-8") as mf:
@@ -1824,6 +2101,10 @@ def dashboard():
         mode = request.form.get("mode") or "overwrite"
         command = (request.form.get("command") or "").strip()
         update_version = (request.form.get("update_version") or "").strip()
+        keyword = (request.form.get("keyword") or "").strip()
+        drive = parse_search_drives(request.form.getlist("drive") or request.form.get("drive"))
+        max_hits = parse_max_hits(request.form.get("max_hits"), 200)
+        collect_path = valid_collect_path(request.form.get("collect_path") or "")
 
         if not machines:
             audit_log("DISPATCH_REJECT", "未选择机台")
@@ -1861,6 +2142,19 @@ def dashboard():
             if not update_meta:
                 audit_log("DISPATCH_REJECT", "升级包不存在 " + update_version)
                 return redirect(url_for("dashboard", error="升级包不存在: " + update_version))
+        elif action == "search_files":
+            keywords = parse_search_keywords(keyword)
+            if not keywords:
+                audit_log("DISPATCH_REJECT", "搜索关键字过短")
+                return redirect(url_for("dashboard", error="请填写关键字，多个用逗号或空格分隔，每个至少 2 个字符"))
+            keyword = ",".join(keywords)
+            if not drive:
+                audit_log("DISPATCH_REJECT", "搜索盘符无效")
+                return redirect(url_for("dashboard", error="请至少选择一个盘符，或选全部本地磁盘"))
+        elif action == "collect_file":
+            if not collect_path:
+                audit_log("DISPATCH_REJECT", "回传路径无效")
+                return redirect(url_for("dashboard", error="请填写本地盘绝对路径（如 D:\\TE\\a.txt），不能是 UNC 或目录"))
         else:
             audit_log("DISPATCH_REJECT", f"未知任务类型 action={action}")
             return redirect(url_for("dashboard", error="未知任务类型"))
@@ -1896,6 +2190,14 @@ def dashboard():
                     "mode": mode,
                     "command": command,
                 }
+                if action == "search_files":
+                    task_data.update({
+                        "keyword": keyword,
+                        "drive": drive,
+                        "max_hits": max_hits,
+                    })
+                if action == "collect_file":
+                    task_data["path"] = collect_path
                 if action == "self_update":
                     task_data.update({
                         "version": update_version,
@@ -1923,6 +2225,10 @@ def dashboard():
                     "start_time": now_str,
                     "action": action,
                     "update_version": update_version if action == "self_update" else "",
+                    "keyword": keyword if action == "search_files" else "",
+                    "drive": drive if action == "search_files" else "",
+                    "max_hits": max_hits if action == "search_files" else "",
+                    "collect_path": collect_path if action == "collect_file" else "",
                 })
             if len(results) > MAX_RESULTS:
                 del results[:-MAX_RESULTS]
@@ -1939,6 +2245,16 @@ def dashboard():
                 "DISPATCH",
                 f"action=self_update version={update_version} machines=[{machines_txt}] "
                 f"skipped=[{','.join(skipped)}]",
+            )
+        elif action == "search_files":
+            audit_log(
+                "SEARCH_FILES",
+                f"keyword={keyword} drive={drive} max_hits={max_hits} machines=[{machines_txt}]",
+            )
+        elif action == "collect_file":
+            audit_log(
+                "COLLECT_FILE",
+                f"path={collect_path} machines=[{machines_txt}]",
             )
         else:
             audit_log(
@@ -2185,6 +2501,9 @@ body {
 .badge.ver { background: #0a4d8c; min-width: auto; }
 .badge.ver.old { background: #64748b; }
 .m-name { min-width: 110px; }
+.drive-picks { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; }
+.drive-opt { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; font-size: 13px; cursor: pointer; }
+.drive-opt input { margin: 0; }
 .form-row { margin-bottom: 12px; }
 .form-row label { display: block; font-weight: 700; margin-bottom: 4px; font-size: 13px; }
 .form-row input[type="text"], .form-row select {
@@ -2411,6 +2730,21 @@ tr:nth-child(even) { background: #fafbfc; }
   padding: 0 4px;
 }
 input[type="checkbox"]:disabled { opacity: 0.45; cursor: not-allowed; }
+.hits-box { margin-top: 6px; font-size: 12px; }
+.hits-box summary { cursor: pointer; color: var(--accent); font-weight: 700; }
+.hits-list { margin: 6px 0 0; padding: 0; list-style: none; max-height: 220px; overflow: auto; }
+.hits-list li {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  padding: 4px 0;
+  border-bottom: 1px dashed #eef2f6;
+}
+.hit-kw { color: var(--accent); font-weight: 700; flex-shrink: 0; }
+.hit-path { flex: 1; min-width: 0; word-break: break-all; }
+.hit-meta { color: var(--muted); flex-shrink: 0; white-space: nowrap; }
+.file-dl { margin-top: 4px; }
+.file-dl a { color: var(--accent); font-weight: 700; }
 </style>
 </head>
 <body>
@@ -2427,7 +2761,7 @@ input[type="checkbox"]:disabled { opacity: 0.45; cursor: not-allowed; }
   </div>
 </div>
 <div style="background:#0f2433;color:#9fb3c8;font-size:12px;padding:6px 20px;">
-  操作审计已开启：访问 IP 与下发记录保存在服务器 log/audit/ 目录（按日归档）。Agent 升级包放在 packages\ 目录，任务类型选「推送 Agent 升级」。
+  操作审计已开启：访问 IP 与下发记录保存在服务器 log/audit/ 目录（按日归档）。Agent 升级包放在 packages\ 目录。可按关键字搜索机台本机文件（MFT），再点命中项回传（单文件约 80MB 内）。
 </div>
 
 <div class="wrap">
@@ -2493,6 +2827,8 @@ input[type="checkbox"]:disabled { opacity: 0.45; cursor: not-allowed; }
             <option value="deploy_folder">复制文件/文件夹</option>
             <option value="run_command">执行命令</option>
             <option value="self_update">推送 Agent 升级</option>
+            <option value="search_files">搜索文件</option>
+            <option value="collect_file">回传文件</option>
           </select>
         </div>
 
@@ -2538,10 +2874,10 @@ input[type="checkbox"]:disabled { opacity: 0.45; cursor: not-allowed; }
             <select name="update_version" id="update_version_sel">
               <option value="">（请先上传升级包）</option>
             </select>
-            <div class="hint">仅对已上报版本号的新 Agent 生效。新安装包默认装到当前用户 %LOCALAPPDATA%\agent，无需管理员；装好后即可网页升级。已在 Program Files 的机台用新包再装一次即可。</div>
+            <div class="hint">网页升级与手工安装用同一份包。机台按系统自动选 Win7 或 Win10 运行时。仅对已上报版本号的 Agent 生效。新安装包默认装到当前用户 %LOCALAPPDATA%\agent。</div>
           </div>
           <div class="form-row">
-            <label>上传新包（zip 内为 agent.exe + _internal）</label>
+            <label>上传新包（一份 zip：启动器 + win10 + win7，机台自适应）</label>
             <input type="file" id="pkg_file" accept=".zip">
             <input type="text" id="pkg_version" placeholder="版本号，如 2.0.0（可从文件名识别）" style="margin-top:6px;">
             <input type="text" id="pkg_notes" placeholder="备注（可选）" style="margin-top:6px;">
@@ -2550,6 +2886,37 @@ input[type="checkbox"]:disabled { opacity: 0.45; cursor: not-allowed; }
               <button type="button" class="btn-secondary" id="btn_select_outdated">勾选可升级机台</button>
             </div>
             <div class="hint" id="pkg_upload_msg"></div>
+          </div>
+        </div>
+
+        <div id="search_fields" style="display:none;">
+          <div class="form-row">
+            <label>关键字</label>
+            <input type="text" name="keyword" id="keyword_inp" value="" placeholder="多个关键字用逗号或空格分隔，如 RustDesk, host">
+            <div class="hint">任一关键字命中即可。每个至少 2 个字符，总共最多返回 200 条。两侧都走 MFT（需管理员），不落地独立扫描 exe。</div>
+          </div>
+          <div class="form-row">
+            <label>盘符</label>
+            <div class="drive-picks">
+              <label class="drive-opt"><input type="checkbox" class="drive_pick" name="drive" value="D:" checked> D:</label>
+              <label class="drive-opt"><input type="checkbox" class="drive_pick" name="drive" value="C:"> C:</label>
+              <label class="drive-opt"><input type="checkbox" class="drive_pick" name="drive" value="E:"> E:</label>
+              <label class="drive-opt"><input type="checkbox" id="drive_all" name="drive" value="all"> 全部本地磁盘</label>
+            </div>
+            <div class="hint">可多选。默认 D:。选「全部本地磁盘」时由机台扫描本机固定盘和移动盘（不含光驱/网络盘）。</div>
+          </div>
+          <div class="form-row">
+            <label>最多返回</label>
+            <input type="number" name="max_hits" id="max_hits_inp" value="200" min="1" max="500" style="width:100px;">
+            <div class="hint">默认 200，上限 500。超出时只返回前 N 条。</div>
+          </div>
+        </div>
+
+        <div id="collect_fields" style="display:none;">
+          <div class="form-row">
+            <label>本机绝对路径</label>
+            <input type="text" name="collect_path" id="collect_path_inp" value="" placeholder="例如 D:\\TE\\xxx.txt">
+            <div class="hint">只收本地盘文件（X:\\...），拒绝 UNC 和目录，单文件约 80MB 以内。也可在搜索命中里点「回传」。</div>
           </div>
         </div>
 
@@ -2758,9 +3125,33 @@ function toggleActionFields() {
   document.getElementById('deploy_fields').style.display = action === 'deploy_folder' ? 'block' : 'none';
   document.getElementById('cmd_fields').style.display = action === 'run_command' ? 'block' : 'none';
   document.getElementById('update_fields').style.display = action === 'self_update' ? 'block' : 'none';
+  document.getElementById('search_fields').style.display = action === 'search_files' ? 'block' : 'none';
+  document.getElementById('collect_fields').style.display = action === 'collect_file' ? 'block' : 'none';
 }
 
 document.getElementById('action_sel').addEventListener('change', toggleActionFields);
+
+function syncDrivePicks() {
+  const all = document.getElementById('drive_all');
+  const on = !!(all && all.checked);
+  const picks = document.querySelectorAll('.drive_pick');
+  picks.forEach(el => {
+    el.disabled = on;
+    if (on) el.checked = false;
+  });
+  if (!on && !Array.from(picks).some(el => el.checked)) {
+    const d = document.querySelector('.drive_pick[value="D:"]');
+    if (d) d.checked = true;
+  }
+}
+const driveAll = document.getElementById('drive_all');
+if (driveAll) driveAll.addEventListener('change', syncDrivePicks);
+document.querySelectorAll('.drive_pick').forEach(el => {
+  el.addEventListener('change', function () {
+    if (this.checked && driveAll) driveAll.checked = false;
+    syncDrivePicks();
+  });
+});
 
 const cmdPresetBtn = document.getElementById('cmd_preset_btn');
 const cmdPresetMenu = document.getElementById('cmd_preset_menu');
@@ -2963,8 +3354,32 @@ document.getElementById('task_form').addEventListener('submit', function (e) {
       alert('请先上传并选择要推送的 Agent 版本');
       return;
     }
-    if (!confirm('将向选中机台推送 Agent ' + ver + '。旧版（无版本号）会被跳过。机台会下载 zip、替换 agent.exe 与 _internal 后自动重启。确认？')) {
+    if (!confirm('将向选中机台推送 Agent ' + ver + '。旧版（无版本号）会被跳过。同一份 zip 在 Win7/Win10 上自动选用运行时后重启。确认？')) {
       e.preventDefault();
+      return;
+    }
+  }
+  if (action === 'search_files') {
+    const kw = (document.getElementById('keyword_inp').value || '').trim();
+    const allDrv = document.getElementById('drive_all');
+    const picks = Array.from(document.querySelectorAll('.drive_pick:checked')).map(el => el.value);
+    const words = kw.split(/[,;\s\u3000\uFF0C\u3001]+/).map(s => s.replace(/^["']|["']$/g, '')).filter(s => s.length >= 2);
+    if (!words.length) {
+      e.preventDefault();
+      alert('请填写关键字，多个用逗号或空格分隔，每个至少 2 个字符');
+      return;
+    }
+    if (!(allDrv && allDrv.checked) && !picks.length) {
+      e.preventDefault();
+      alert('请至少选择一个盘符，或选全部本地磁盘');
+      return;
+    }
+  }
+  if (action === 'collect_file') {
+    const p = (document.getElementById('collect_path_inp').value || '').trim();
+    if (!/^[A-Za-z]:[\\/]/.test(p) || p.indexOf('\\\\') === 0) {
+      e.preventDefault();
+      alert('请填写本地盘绝对路径（如 D:\\TE\\a.txt），不能是 UNC 或目录');
       return;
     }
   }
@@ -3018,6 +3433,12 @@ function renderProgress(r) {
     label = pct + '% 清理中';
   } else if (/即将重启替换|正在备份并替换|正在启动新 Agent|等待新进程启动/.test(msg)) {
     label = pct + '% 替换中';
+  } else if (/扫描|MFT|过滤|遍历/.test(msg)) {
+    label = pct > 0 ? (pct + '% 搜索中') : '搜索中';
+    indeterminate = pct <= 0;
+  } else if (/回传/.test(msg)) {
+    label = pct > 0 ? (pct + '% 回传中') : '回传中';
+    indeterminate = pct <= 0;
   } else if (/下载|校验|解压|升级|替换 Agent/.test(msg)) {
     label = pct + '% 升级中';
   } else if (Number(r.copied_files) > 0 && r.status === 'progress' && !(r.copied_bytes > 0 && r.total_bytes > 0) && msg.indexOf('复制中') < 0) {
@@ -3150,9 +3571,29 @@ function cancelTask(taskId, all) {
   }).catch(err => alert('取消失败: ' + err));
 }
 
+let lastResultsSig = '';
+function resultRowKey(r) {
+  return String(r.task_id || ((r.machine || '') + '|' + (r.time || '') + '|' + (r.message || '')));
+}
+function getHitsUiState() {
+  const state = {};
+  document.querySelectorAll('#results_body details.hits-box').forEach(el => {
+    const tr = el.closest('tr');
+    const key = tr && tr.dataset.resultKey;
+    if (!key) return;
+    const list = el.querySelector('.hits-list');
+    state[key] = { open: !!el.open, scroll: list ? list.scrollTop : 0 };
+  });
+  return state;
+}
+
 function fetchResults() {
   fetch('/results_json').then(r => r.json()).then(data => {
-    allResults = data || [];
+    const next = data || [];
+    const sig = JSON.stringify(next);
+    allResults = next;
+    if (sig === lastResultsSig) return;
+    lastResultsSig = sig;
     drawResults();
   }).catch(() => {});
 }
@@ -3160,6 +3601,7 @@ function fetchResults() {
 function drawResults() {
   const machineFilter = (document.getElementById('filter_machine').value || '').trim().toLowerCase();
   const statusFilter = document.getElementById('filter_status').value;
+  const hitsUi = getHitsUiState();
   const tbody = document.querySelector('#results_body');
   tbody.innerHTML = '';
   let shown = 0;
@@ -3171,6 +3613,8 @@ function drawResults() {
     filtered.push(r);
     shown += 1;
     const tr = document.createElement('tr');
+    const rowKey = resultRowKey(r);
+    tr.dataset.resultKey = rowKey;
     const statusClassName = statusClass(r);
     const dur = rowDurationText(r);
     const tip = (r.start_time ? ('开始: ' + r.start_time) : '') + (r.end_time ? (' / 结束: ' + r.end_time) : '');
@@ -3185,9 +3629,14 @@ function drawResults() {
       <td class="${statusClassName}">${esc(statusText(r))}</td>
       <td>${renderProgress(r)}</td>
       <td title="${esc(tip)}">${esc(dur)}</td>
-      <td>${esc(r.message || '')}</td>
+      <td class="log-msg">${renderLogMessage(r, hitsUi[rowKey])}</td>
       <td>${act}</td>`;
     tbody.appendChild(tr);
+    const kept = hitsUi[rowKey];
+    if (kept && kept.open && kept.scroll) {
+      const list = tr.querySelector('.hits-list');
+      if (list) list.scrollTop = kept.scroll;
+    }
   });
   document.getElementById('log_count').textContent = `显示 ${shown} / 共 ${allResults.length} 条`;
   document.getElementById('duration_summary').textContent = buildDurationSummary(allResults);
@@ -3195,7 +3644,118 @@ function drawResults() {
 
 document.getElementById('filter_machine').addEventListener('input', drawResults);
 document.getElementById('filter_status').addEventListener('change', drawResults);
+function renderLogMessage(r, hitsState) {
+  let html = '<div>' + esc(r.message || '') + '</div>';
+  if (r.file_url) {
+    const name = r.file_name || '文件';
+    const sizeTxt = r.file_size ? ('（' + formatBytes(r.file_size) + '）') : '';
+    html += '<div class="file-dl"><a href="' + esc(r.file_url) + '">下载 ' + esc(name) + sizeTxt + '</a></div>';
+  }
+  const hits = Array.isArray(r.hits) ? r.hits : [];
+  if (hits.length) {
+    const n = Number(r.hit_count) || hits.length;
+    const extra = r.truncated ? '（仅返回前 ' + hits.length + ' 条）' : '';
+    const openAttr = hitsState && hitsState.open ? ' open' : '';
+    html += '<details class="hits-box"' + openAttr + '><summary>命中 ' + n + ' 条' + extra + '</summary><ul class="hits-list">';
+    hits.forEach(h => {
+      const path = absHitPath((h && h.path) || '', r.drive);
+      const name = (h && h.name) || '';
+      const isDir = !!(h && h.is_dir);
+      const sizeTxt = isDir ? '目录' : formatBytes(h && h.size);
+      const enc = encodeURIComponent(path);
+      const matched = (h && (h.matched || h.keyword)) || '';
+      html += '<li>'
+        + (matched ? '<span class="hit-kw">' + esc(matched) + '</span>' : '')
+        + '<span class="hit-path">' + esc(path || name) + '</span>'
+        + '<span class="hit-meta">' + esc(sizeTxt) + '</span>'
+        + '<button type="button" class="btn-act btn-copy-path" data-path="' + enc + '">复制</button>';
+      if (!isDir && path) {
+        html += '<button type="button" class="btn-act btn-collect-file" data-machine="' + esc(r.machine || '')
+          + '" data-path="' + enc + '" data-drive="' + encodeURIComponent(r.drive || '') + '">回传</button>';
+      }
+      html += '</li>';
+    });
+    html += '</ul></details>';
+  }
+  return html;
+}
+
+function fallbackCopyText(text, done) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.setAttribute('readonly', '');
+  ta.style.position = 'fixed';
+  ta.style.left = '-9999px';
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); } catch (err) {}
+  document.body.removeChild(ta);
+  if (done) done();
+}
+
+function copyText(text, done) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopyText(text, done));
+  } else {
+    fallbackCopyText(text, done);
+  }
+}
+
+function absHitPath(path, drive) {
+  let p = String(path || '').replace(/\//g, '\\').trim();
+  if (!p) return '';
+  if (/^[A-Za-z]:\\/.test(p)) return p;
+  let d = String(drive || '').trim().toUpperCase().replace(/[\\/]+$/, '');
+  if (/^[A-Za-z]$/.test(d)) d += ':';
+  if (!/^[A-Za-z]:$/.test(d)) {
+    const m = d.match(/[A-Z]:/);
+    d = m ? m[0] : 'D:';
+  }
+  if (p.charAt(0) === '\\') return d + p;
+  return d + '\\' + p;
+}
+function readDataPath(el) {
+  const raw = (el && el.getAttribute('data-path')) || '';
+  try { return decodeURIComponent(raw); } catch (err) { return raw; }
+}
+
+function collectRemoteFile(machine, path, drive) {
+  return fetch('/api/collect_file', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ machine: machine, path: path, drive: drive || '' })
+  }).then(r => r.json().then(data => ({ ok: r.ok, data }))).then(res => {
+    if (!res.data || !res.data.ok) {
+      alert((res.data && res.data.error) || '回传任务下发失败');
+      return;
+    }
+    fetchResults();
+  }).catch(err => alert('回传任务下发失败: ' + err));
+}
+
 document.getElementById('results_body').addEventListener('click', function (e) {
+  const copyBtn = e.target.closest('.btn-copy-path');
+  if (copyBtn) {
+    const path = readDataPath(copyBtn);
+    if (!path) return;
+    copyText(path, function () {
+      copyBtn.textContent = '已复制';
+      setTimeout(function () { copyBtn.textContent = '复制'; }, 1200);
+    });
+    return;
+  }
+  const collectBtn = e.target.closest('.btn-collect-file');
+  if (collectBtn) {
+    const machine = collectBtn.getAttribute('data-machine') || '';
+    const path = readDataPath(collectBtn);
+    let drive = collectBtn.getAttribute('data-drive') || '';
+    try { drive = decodeURIComponent(drive); } catch (err) {}
+    if (!machine || !path) return;
+    if (!confirm('从 ' + machine + ' 回传该文件？\n' + path)) return;
+    collectBtn.disabled = true;
+    collectRemoteFile(machine, path, drive).finally(function () { collectBtn.disabled = false; });
+    return;
+  }
   const btn = e.target.closest('.btn-cancel-task');
   if (!btn || btn.disabled) return;
   const taskId = btn.getAttribute('data-task-id');
@@ -3284,6 +3844,8 @@ function renderMachineTree(classes, agentMap, preserveChecked, expanded) {
         const ipStyle = ip ? 'inline-block' : 'none';
         const verTxt = ver || '旧版';
         const verCls = ver ? 'badge ver ver-badge' : 'badge ver ver-badge old';
+        const osTag = info.os === 'win7' ? 'Win7' : (info.os === 'win10' ? 'Win10' : '');
+        const osStyle = osTag ? 'inline-block' : 'none';
         html += `<div class="machine-row" data-machine="${esc(m)}">
           <input type="checkbox" class="machine_chk" data-class="${esc(cls)}" data-sub="${esc(sub)}"
                  name="machines" value="${esc(m)}" ${disabled} ${checked}>
@@ -3291,6 +3853,7 @@ function renderMachineTree(classes, agentMap, preserveChecked, expanded) {
           <span class="badge ${badgeCls}">${badgeTxt}</span>
           <span class="badge ip ip-badge" style="display:${ipStyle};">${esc(ip)}</span>
           <span class="${verCls}">${esc(verTxt)}</span>
+          <span class="badge os-badge" style="display:${osStyle};">${esc(osTag)}</span>
           <span class="badge queue q-badge" style="display:${qStyle};">排队${info.queue || 0}</span>
           <span class="badge busy b-badge" style="display:${bStyle};">执行中</span>
           <button type="button" class="btn-act view btn-view" ${info.online && ver ? '' : 'disabled'} title="查看屏幕（需新版 Agent）">查看屏幕</button>
@@ -3356,6 +3919,15 @@ function applyAgentStatus(agentMap) {
       } else {
         verBadge.className = 'badge ver ver-badge old';
         verBadge.textContent = '旧版';
+      }
+    }
+    const osBadge = row.querySelector('.os-badge');
+    if (osBadge) {
+      if (info.os === 'win7' || info.os === 'win10') {
+        osBadge.style.display = 'inline-block';
+        osBadge.textContent = info.os === 'win7' ? 'Win7' : 'Win10';
+      } else {
+        osBadge.style.display = 'none';
       }
     }
   });

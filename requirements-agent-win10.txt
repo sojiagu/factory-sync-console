@@ -1,0 +1,7 @@
+# 机台 Agent · Win10/Win11（64 位 Python 3.11）
+requests
+urllib3
+pystray
+pillow
+pyinstaller
+mftparser

@@ -1,25 +1,28 @@
 # -*- mode: python ; coding: utf-8 -*-
+# Python 3.8 + Win7. No mftparser (needs 3.9+ / Win10).
 
 block_cipher = None
 
 a = Analysis(
-    ['web.py'],
+    ['agent.py'],
     pathex=[],
     binaries=[],
     datas=[('icon.ico', '.')],
     hiddenimports=[
-        'flask',
-        'jinja2',
-        'waitress',
         'pystray',
         'PIL',
         'PIL.Image',
         'PIL.ImageDraw',
+        'PIL.ImageGrab',
+        'requests',
+        'urllib3',
+        'tkinter',
+        'mftpy',
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=['rthooks/pyi_rth_nozstd.py'],
-    excludes=['zstandard', 'zstd', 'brotli', 'brotlicffi'],
+    excludes=['zstandard', 'zstd', 'brotli', 'brotlicffi', 'mftparser'],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
@@ -33,7 +36,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='工厂同步控制台',
+    name='agent',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -45,7 +48,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon='icon.ico',
-    version='version_info.txt',
+    uac_admin=True,
 )
 
 coll = COLLECT(
@@ -56,5 +59,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='工厂同步控制台',
+    name='agent_win7',
 )

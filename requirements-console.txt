@@ -1,0 +1,6 @@
+# 控制端（Windows 7 / Server 2008 R2 请用 64 位 Python 3.8）
+flask<3.1
+waitress
+pystray
+pillow<11
+pyinstaller>=5.13,<6.12

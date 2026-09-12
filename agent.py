@@ -49,6 +49,7 @@ POLL_INTERVAL = 5
 DEFAULT_SHARE_USER = "1"
 DEFAULT_SHARE_PASS = "1"
 MUTEX_NAME = "MyAgentMutexName"
+LOGON_TASK_NAME = "FactorySyncAgent"
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
 CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -343,6 +344,20 @@ def is_admin():
         return False
 
 
+def windows_os_tag():
+    try:
+        v = sys.getwindowsversion()
+        if int(v.major) >= 10:
+            return "win10"
+    except Exception:
+        pass
+    return "win7"
+
+
+def can_use_mft_search():
+    return windows_os_tag() == "win10"
+
+
 def install_dir_writable(path):
     path = os.path.abspath(path or "")
     if not path or not os.path.isdir(path):
@@ -516,6 +531,21 @@ def get_local_ip(server=None):
 def migrate_legacy_device_ini():
     if os.path.isfile(DEVICE_INI):
         return
+    here = os.path.abspath(BASE_DIR)
+    parent = os.path.dirname(here)
+    for _ in range(3):
+        if not parent:
+            break
+        parent_ini = os.path.join(parent, "device.ini")
+        if os.path.isfile(parent_ini):
+            try:
+                shutil.copy2(parent_ini, DEVICE_INI)
+                log_local("已从安装根目录复制 device.ini")
+                return
+            except Exception as e:
+                log_local("复制父目录 device.ini 失败: %s" % e)
+                break
+        parent = os.path.dirname(parent)
     old = os.path.join(os.environ.get("ProgramFiles(x86)") or r"C:\Program Files (x86)", "agent", "device.ini")
     if not os.path.isfile(old):
         return
@@ -608,6 +638,146 @@ def load_settings():
         "share_user": user,
         "share_pass": password,
     }
+
+
+def remove_startup_shortcuts():
+    names = ("agent.lnk",)
+    folders = (
+        os.path.join(
+            os.environ.get("APPDATA") or "",
+            r"Microsoft\Windows\Start Menu\Programs\Startup",
+        ),
+        os.path.join(
+            os.environ.get("ProgramData") or r"C:\ProgramData",
+            r"Microsoft\Windows\Start Menu\Programs\StartUp",
+        ),
+    )
+    for folder in folders:
+        for name in names:
+            path = os.path.join(folder, name)
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
+
+def logon_task_exe():
+    root = detect_install_root()
+    launcher = os.path.join(root, "agent.exe")
+    if os.path.isfile(launcher):
+        return os.path.abspath(launcher)
+    return os.path.abspath(sys.executable)
+
+
+def _decode_schtasks(raw):
+    if not raw:
+        return ""
+    for enc in ("utf-8", "gbk", "mbcs"):
+        try:
+            return raw.decode(enc)
+        except Exception:
+            continue
+    return raw.decode("utf-8", "replace")
+
+
+def query_logon_task_tr():
+    try:
+        proc = subprocess.run(
+            ["schtasks", "/Query", "/TN", LOGON_TASK_NAME, "/FO", "LIST", "/V"],
+            capture_output=True,
+            creationflags=CREATE_NO_WINDOW,
+            timeout=8,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    text = _decode_schtasks(proc.stdout) + "\n" + _decode_schtasks(proc.stderr)
+    for line in text.splitlines():
+        key = line.split(":", 1)[0].strip().lower()
+        if key in ("task to run", "要运行的任务", "运行的程序"):
+            return line.split(":", 1)[-1].strip().strip('"')
+        if "要运行的任务" in line or line.lower().startswith("task to run"):
+            return line.split(":", 1)[-1].strip().strip('"')
+    return ""
+
+
+def _same_exe(a, b):
+    try:
+        return os.path.normcase(os.path.abspath(a or "")) == os.path.normcase(os.path.abspath(b or ""))
+    except Exception:
+        return False
+
+
+def _write_logon_task_flag(root, exe):
+    try:
+        with open(os.path.join(root, "logon_task.flag"), "w", encoding="utf-8") as f:
+            f.write(exe)
+    except Exception:
+        pass
+
+
+def logon_task_ready(exe):
+    current = query_logon_task_tr()
+    if current is None:
+        return False
+    return (not current) or _same_exe(current, exe)
+
+
+def ensure_elevated_logon_task():
+    """管理员进程注册「登录时最高权限」任务；成功后才去掉启动文件夹快捷方式。"""
+    if not getattr(sys, "frozen", False) or not is_admin():
+        return
+    exe = logon_task_exe()
+    root = detect_install_root()
+    flag = os.path.join(root, "logon_task.flag")
+    try:
+        old = ""
+        if os.path.isfile(flag):
+            with open(flag, "r", encoding="utf-8") as f:
+                old = (f.read() or "").strip()
+        if old == exe and logon_task_ready(exe):
+            remove_startup_shortcuts()
+            return
+    except Exception:
+        pass
+    cmd = [
+        "schtasks",
+        "/Create",
+        "/TN",
+        LOGON_TASK_NAME,
+        "/TR",
+        exe,
+        "/SC",
+        "ONLOGON",
+        "/RL",
+        "HIGHEST",
+        "/F",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd + ["/IT"],
+            capture_output=True,
+            creationflags=CREATE_NO_WINDOW,
+            timeout=12,
+        )
+        if proc.returncode != 0:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                creationflags=CREATE_NO_WINDOW,
+                timeout=12,
+            )
+        if proc.returncode != 0:
+            err = (_decode_schtasks(proc.stderr) or _decode_schtasks(proc.stdout)).strip()
+            log_local("注册登录计划任务失败: %s" % (err or proc.returncode))
+            return
+        _write_logon_task_flag(root, exe)
+        remove_startup_shortcuts()
+        log_local("已注册登录计划任务 %s -> %s" % (LOGON_TASK_NAME, exe))
+    except Exception as e:
+        log_local("注册登录计划任务失败: %s" % e)
 
 
 def stop_other_agent_instances():
@@ -1504,7 +1674,7 @@ def deploy_folder(task):
 
 
 # ===============================
-# 自升级（onedir: agent.exe + _internal）
+# 自升级（统一包：启动器 + win10 + win7；兼容旧 onedir）
 # ===============================
 def sha256_file(path):
     h = hashlib.sha256()
@@ -1517,18 +1687,131 @@ def sha256_file(path):
     return h.hexdigest()
 
 
-def find_payload(extract_dir):
+def detect_install_root():
+    here = os.path.abspath(BASE_DIR)
+    name = os.path.basename(here).lower()
+    parent = os.path.dirname(here)
+    if name in ("win10", "win7") and parent:
+        for cand in (parent, os.path.dirname(parent)):
+            if not cand:
+                continue
+            if os.path.isfile(os.path.join(cand, "agent.exe")) and (
+                os.path.isdir(os.path.join(cand, "win10"))
+                or os.path.isdir(os.path.join(cand, "_internal", "win10"))
+            ):
+                return cand
+        sibling = "win7" if name == "win10" else "win10"
+        if os.path.isdir(os.path.join(parent, sibling)):
+            gp = os.path.dirname(parent)
+            if os.path.basename(parent).lower() == "_internal" and os.path.isfile(os.path.join(gp, "agent.exe")):
+                return gp
+            return parent
+        if os.path.isfile(os.path.join(parent, "agent.exe")):
+            return parent
+    return here
+
+
+def iter_update_paths(name):
+    yield os.path.join(BASE_DIR, name)
+    root = detect_install_root()
+    if os.path.abspath(root) != os.path.abspath(BASE_DIR):
+        yield os.path.join(root, name)
+
+
+def any_update_marker(name):
+    return any(os.path.exists(p) for p in iter_update_paths(name))
+
+
+def remove_update_markers(*names):
+    for name in names:
+        for p in iter_update_paths(name):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+
+def _runtime_ok(root, *parts):
+    base = os.path.join(root, *parts)
+    return os.path.isfile(os.path.join(base, "agent.exe")) and os.path.isdir(os.path.join(base, "_internal"))
+
+
+def is_dual_bundle(root):
+    if not os.path.isfile(os.path.join(root, "agent.exe")):
+        return False
+    if _runtime_ok(root, "win10") and _runtime_ok(root, "win7"):
+        return True
+    if _runtime_ok(root, "_internal", "win10") and _runtime_ok(root, "_internal", "win7"):
+        return True
+    return False
+
+
+def bundle_has_os(root, os_tag):
+    os_tag = (os_tag or "").lower()
+    if os_tag not in ("win10", "win7"):
+        return False
+    return _runtime_ok(root, os_tag) or _runtime_ok(root, "_internal", os_tag)
+
+
+def is_bundle_payload(root):
+    return os.path.isfile(os.path.join(root, "agent.exe")) and (
+        bundle_has_os(root, "win10") or bundle_has_os(root, "win7")
+    )
+
+
+def is_onedir_payload(root):
+    return os.path.isfile(os.path.join(root, "agent.exe")) and os.path.isdir(os.path.join(root, "_internal"))
+
+
+def find_update_payload(extract_dir):
+    onedir = None
     for root, dirs, files in os.walk(extract_dir):
-        if "agent.exe" in files:
-            internal = os.path.join(root, "_internal")
-            return os.path.join(root, "agent.exe"), internal if os.path.isdir(internal) else None
+        if is_bundle_payload(root):
+            return "bundle", root
+        if onedir is None and is_onedir_payload(root):
+            onedir = root
         depth = root[len(extract_dir):].count(os.sep)
-        if depth >= 2:
+        if depth >= 3:
             dirs[:] = []
+    if onedir:
+        return "onedir", onedir
     return None, None
 
 
-def write_apply_scripts(bat_path, payload_dir, install_dir, new_ver, task_id):
+def _zip_member_norm(name):
+    return (name or "").replace("\\", "/").lower().strip("/")
+
+
+def skip_other_os_zip_member(name, keep_os):
+    """统一包只解压当前系统运行时。Win10 不落地 win7 / mftscan.exe。"""
+    n = _zip_member_norm(name)
+    if not n:
+        return False
+    keep_os = (keep_os or "").lower()
+    if keep_os not in ("win10", "win7"):
+        return False
+    drop_os = "win7" if keep_os == "win10" else "win10"
+    parts = n.split("/")
+    if drop_os in parts:
+        return True
+    if keep_os == "win10" and parts[-1] == "mftscan.exe":
+        return True
+    return False
+
+
+def extract_update_zip(zip_path, extract_dir, keep_os):
+    skipped = 0
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for info in zf.infolist():
+            if skip_other_os_zip_member(info.filename, keep_os):
+                skipped += 1
+                continue
+            zf.extract(info, extract_dir)
+    return skipped
+
+
+def write_apply_scripts(bat_path, payload_dir, install_dir, new_ver, task_id, kind="onedir", keep_os=""):
     # 保留 device.ini / log。不用 PowerShell，避免 360 主动防御拦截。
     work = os.path.dirname(bat_path)
     report_url = (CONTROL_SERVER or "").rstrip("/") + REPORT_ENDPOINT
@@ -1552,11 +1835,14 @@ def write_apply_scripts(bat_path, payload_dir, install_dir, new_ver, task_id):
                 ensure_ascii=False,
             )
 
+    kind = "bundle" if kind == "bundle" else "onedir"
     content = r"""@echo off
 setlocal EnableExtensions EnableDelayedExpansion
 set "INSTALL=__INSTALL__"
 set "SRC=__SRC__"
 set "VER=__VER__"
+set "KIND=__KIND__"
+set "OS_KEEP=__OSKEEP__"
 set "AGENT_REPORT=__REPORT__"
 set "CURL=%SystemRoot%\System32\curl.exe"
 
@@ -1566,8 +1852,9 @@ ping -n 2 127.0.0.1 >nul
 call :POST 88
 
 if exist "%INSTALL%\agent.exe" copy /y "%INSTALL%\agent.exe" "%INSTALL%\agent.exe.bak" >nul
-if exist "%INSTALL%\_internal.bak" rd /s /q "%INSTALL%\_internal.bak"
+if /I "%KIND%"=="bundle" goto BUNDLE
 
+if exist "%INSTALL%\_internal.bak" rd /s /q "%INSTALL%\_internal.bak"
 set /a _mv=0
 :MV_INTERNAL
 if not exist "%INSTALL%\_internal" goto MV_OK
@@ -1578,7 +1865,6 @@ if !_mv! GEQ 8 goto FAIL
 ping -n 2 127.0.0.1 >nul
 goto MV_INTERNAL
 :MV_OK
-
 copy /y "%SRC%\agent.exe" "%INSTALL%\agent.exe" >nul
 if errorlevel 1 goto FAIL
 if exist "%SRC%\_internal" (
@@ -1587,10 +1873,55 @@ if exist "%SRC%\_internal" (
 )
 if exist "%SRC%\icon.ico" copy /y "%SRC%\icon.ico" "%INSTALL%\icon.ico" >nul
 if exist "%INSTALL%\_internal\icon.ico" copy /y "%INSTALL%\_internal\icon.ico" "%INSTALL%\icon.ico" >nul
+goto FLAGS
+
+:BUNDLE
+copy /y "%SRC%\agent.exe" "%INSTALL%\agent.exe" >nul
+if errorlevel 1 goto FAIL
+if /I "%OS_KEEP%"=="win7" goto SKIP_WIN10
+if exist "%SRC%\win10\agent.exe" (
+  robocopy "%SRC%\win10" "%INSTALL%\win10" /E /IS /IT /R:1 /W:1 /NFL /NDL /NJH /NJS /NC /NS /NP >nul
+  if errorlevel 8 goto FAIL
+)
+if exist "%SRC%\_internal\win10\agent.exe" (
+  robocopy "%SRC%\_internal\win10" "%INSTALL%\_internal\win10" /E /IS /IT /R:1 /W:1 /NFL /NDL /NJH /NJS /NC /NS /NP >nul
+  if errorlevel 8 goto FAIL
+)
+:SKIP_WIN10
+if /I "%OS_KEEP%"=="win10" goto SKIP_WIN7
+if exist "%SRC%\win7\agent.exe" (
+  robocopy "%SRC%\win7" "%INSTALL%\win7" /E /IS /IT /R:1 /W:1 /NFL /NDL /NJH /NJS /NC /NS /NP >nul
+  if errorlevel 8 goto FAIL
+)
+if exist "%SRC%\_internal\win7\agent.exe" (
+  robocopy "%SRC%\_internal\win7" "%INSTALL%\_internal\win7" /E /IS /IT /R:1 /W:1 /NFL /NDL /NJH /NJS /NC /NS /NP >nul
+  if errorlevel 8 goto FAIL
+)
+:SKIP_WIN7
+if exist "%INSTALL%\device.ini" if exist "%INSTALL%\win10\agent.exe" if not exist "%INSTALL%\win10\device.ini" copy /y "%INSTALL%\device.ini" "%INSTALL%\win10\device.ini" >nul
+if exist "%INSTALL%\device.ini" if exist "%INSTALL%\win7\agent.exe" if not exist "%INSTALL%\win7\device.ini" copy /y "%INSTALL%\device.ini" "%INSTALL%\win7\device.ini" >nul
+if exist "%INSTALL%\device.ini" if exist "%INSTALL%\_internal\win10\agent.exe" if not exist "%INSTALL%\_internal\win10\device.ini" copy /y "%INSTALL%\device.ini" "%INSTALL%\_internal\win10\device.ini" >nul
+if exist "%INSTALL%\device.ini" if exist "%INSTALL%\_internal\win7\agent.exe" if not exist "%INSTALL%\_internal\win7\device.ini" copy /y "%INSTALL%\device.ini" "%INSTALL%\_internal\win7\device.ini" >nul
+if exist "%INSTALL%\update_pending.json" if exist "%INSTALL%\win10\agent.exe" copy /y "%INSTALL%\update_pending.json" "%INSTALL%\win10\update_pending.json" >nul
+if exist "%INSTALL%\update_pending.json" if exist "%INSTALL%\win7\agent.exe" copy /y "%INSTALL%\update_pending.json" "%INSTALL%\win7\update_pending.json" >nul
+if exist "%INSTALL%\update_pending.json" if exist "%INSTALL%\_internal\win10\agent.exe" copy /y "%INSTALL%\update_pending.json" "%INSTALL%\_internal\win10\update_pending.json" >nul
+if exist "%INSTALL%\update_pending.json" if exist "%INSTALL%\_internal\win7\agent.exe" copy /y "%INSTALL%\update_pending.json" "%INSTALL%\_internal\win7\update_pending.json" >nul
+
+:FLAGS
 del /f /q "%INSTALL%\update_fail.flag" >nul 2>&1
+if exist "%INSTALL%\win10\update_fail.flag" del /f /q "%INSTALL%\win10\update_fail.flag" >nul 2>&1
+if exist "%INSTALL%\win7\update_fail.flag" del /f /q "%INSTALL%\win7\update_fail.flag" >nul 2>&1
+if exist "%INSTALL%\_internal\win10\update_fail.flag" del /f /q "%INSTALL%\_internal\win10\update_fail.flag" >nul 2>&1
+if exist "%INSTALL%\_internal\win7\update_fail.flag" del /f /q "%INSTALL%\_internal\win7\update_fail.flag" >nul 2>&1
 echo %VER%> "%INSTALL%\update_ok.flag"
+if exist "%INSTALL%\win10\agent.exe" echo %VER%> "%INSTALL%\win10\update_ok.flag"
+if exist "%INSTALL%\win7\agent.exe" echo %VER%> "%INSTALL%\win7\update_ok.flag"
+if exist "%INSTALL%\_internal\win10\agent.exe" echo %VER%> "%INSTALL%\_internal\win10\update_ok.flag"
+if exist "%INSTALL%\_internal\win7\agent.exe" echo %VER%> "%INSTALL%\_internal\win7\update_ok.flag"
 
 call :POST 92
+schtasks /Create /TN "FactorySyncAgent" /TR "%INSTALL%\agent.exe" /SC ONLOGON /RL HIGHEST /F /IT >nul 2>&1
+if errorlevel 1 schtasks /Create /TN "FactorySyncAgent" /TR "%INSTALL%\agent.exe" /SC ONLOGON /RL HIGHEST /F >nul 2>&1
 set /a _try=0
 :START_TRY
 start "" "%INSTALL%\agent.exe"
@@ -1607,11 +1938,21 @@ exit /b 0
 
 :FAIL
 echo FAIL> "%INSTALL%\update_fail.flag"
+if exist "%INSTALL%\win10\agent.exe" echo FAIL> "%INSTALL%\win10\update_fail.flag"
+if exist "%INSTALL%\win7\agent.exe" echo FAIL> "%INSTALL%\win7\update_fail.flag"
+if exist "%INSTALL%\_internal\win10\agent.exe" echo FAIL> "%INSTALL%\_internal\win10\update_fail.flag"
+if exist "%INSTALL%\_internal\win7\agent.exe" echo FAIL> "%INSTALL%\_internal\win7\update_fail.flag"
 if exist "%INSTALL%\update_ok.flag" del /f /q "%INSTALL%\update_ok.flag" >nul 2>&1
+if exist "%INSTALL%\win10\update_ok.flag" del /f /q "%INSTALL%\win10\update_ok.flag" >nul 2>&1
+if exist "%INSTALL%\win7\update_ok.flag" del /f /q "%INSTALL%\win7\update_ok.flag" >nul 2>&1
+if exist "%INSTALL%\_internal\win10\update_ok.flag" del /f /q "%INSTALL%\_internal\win10\update_ok.flag" >nul 2>&1
+if exist "%INSTALL%\_internal\win7\update_ok.flag" del /f /q "%INSTALL%\_internal\win7\update_ok.flag" >nul 2>&1
 if exist "%INSTALL%\agent.exe.bak" copy /y "%INSTALL%\agent.exe.bak" "%INSTALL%\agent.exe" >nul
 if exist "%INSTALL%\_internal.bak" (
-  if exist "%INSTALL%\_internal" rd /s /q "%INSTALL%\_internal"
-  move /y "%INSTALL%\_internal.bak" "%INSTALL%\_internal" >nul
+  if not exist "%INSTALL%\win10\_internal" (
+    if exist "%INSTALL%\_internal" rd /s /q "%INSTALL%\_internal"
+    move /y "%INSTALL%\_internal.bak" "%INSTALL%\_internal" >nul
+  )
 )
 start "" "%INSTALL%\agent.exe"
 exit /b 1
@@ -1627,6 +1968,8 @@ goto :eof
         content.replace("__INSTALL__", install_dir)
         .replace("__SRC__", payload_dir)
         .replace("__VER__", new_ver)
+        .replace("__KIND__", kind)
+        .replace("__OSKEEP__", keep_os or "")
         .replace("__REPORT__", report_url)
     )
     with open(bat_path, "w", encoding="gbk", errors="replace") as f:
@@ -1648,7 +1991,7 @@ def self_update(task):
     version = (task.get("version") or "").strip()
     url = (task.get("url") or "").strip()
     expect_sha = (task.get("sha256") or "").strip().lower()
-    install_dir = BASE_DIR
+    install_dir = detect_install_root()
 
     if not getattr(sys, "frozen", False):
         report_result(task_id, "error", "当前为脚本模式，不执行自升级")
@@ -1672,9 +2015,7 @@ def self_update(task):
     os.makedirs(work, exist_ok=True)
     zip_path = os.path.join(work, "pkg.zip")
     extract_dir = os.path.join(work, "extract")
-    payload_dir = os.path.join(work, "payload")
     os.makedirs(extract_dir, exist_ok=True)
-    os.makedirs(payload_dir, exist_ok=True)
 
     report_result(task_id, "progress", "开始下载 Agent %s ..." % version, 5)
     log_local("下载升级包 %s" % url)
@@ -1716,44 +2057,38 @@ def self_update(task):
         report_result(task_id, "error", "校验失败 sha256=%s 期望=%s" % (digest, expect_sha))
         return
 
-    report_result(task_id, "progress", "解压升级包...", 65)
+    keep_os = windows_os_tag()
+    skip_os = "win7" if keep_os == "win10" else "win10"
+    report_result(task_id, "progress", "解压升级包（本机 %s，跳过 %s）..." % (keep_os, skip_os), 65)
     try:
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(extract_dir)
+        skipped = extract_update_zip(zip_path, extract_dir, keep_os)
     except Exception as e:
         report_result(task_id, "error", "解压失败: %s" % e)
         return
+    if skipped:
+        log_local("升级解压跳过 %s 条目 %s" % (skipped, skip_os))
 
-    exe_path, internal_dir = find_payload(extract_dir)
-    if not exe_path:
-        report_result(task_id, "error", "升级包内未找到 agent.exe（需含 agent.exe + _internal）")
+    kind, src_dir = find_update_payload(extract_dir)
+    if not kind or not src_dir:
+        report_result(task_id, "error", "升级包无效（需统一包 agent.exe+win10+win7，或旧版 agent.exe+_internal）")
         return
-    shutil.copy2(exe_path, os.path.join(payload_dir, "agent.exe"))
-    if internal_dir:
-        dest_internal = os.path.join(payload_dir, "_internal")
-        if os.path.isdir(dest_internal):
-            shutil.rmtree(dest_internal, ignore_errors=True)
-        shutil.copytree(internal_dir, dest_internal)
-    else:
-        report_result(task_id, "error", "升级包缺少 _internal 目录（分离式安装需要）")
+    if kind == "bundle" and not bundle_has_os(src_dir, keep_os):
+        report_result(task_id, "error", "升级包缺少当前系统 %s 运行时" % keep_os)
         return
-    icon_src = os.path.join(os.path.dirname(exe_path), "icon.ico")
-    if not os.path.isfile(icon_src) and internal_dir:
-        icon_src = os.path.join(internal_dir, "icon.ico")
-    if os.path.isfile(icon_src):
-        try:
-            shutil.copy2(icon_src, os.path.join(payload_dir, "icon.ico"))
-        except Exception:
-            pass
+    if kind == "onedir" and is_bundle_payload(install_dir):
+        report_result(task_id, "error", "当前已是统一安装，请上传含 win10+win7 的统一升级包")
+        return
+    payload_dir = src_dir
 
     bat_path = os.path.join(work, "apply.bat")
-    write_apply_scripts(bat_path, payload_dir, install_dir, version, task_id)
-    pending = {"task_id": task_id, "version": version, "from": AGENT_VERSION}
-    try:
-        with open(PENDING_FILE, "w", encoding="utf-8") as f:
-            json.dump(pending, f, ensure_ascii=False)
-    except Exception as e:
-        log_local("写 update_pending 失败: %s" % e)
+    write_apply_scripts(bat_path, payload_dir, install_dir, version, task_id, kind=kind, keep_os=keep_os)
+    pending = {"task_id": task_id, "version": version, "from": AGENT_VERSION, "kind": kind}
+    for pending_path in (PENDING_FILE, os.path.join(install_dir, "update_pending.json")):
+        try:
+            with open(pending_path, "w", encoding="utf-8") as f:
+                json.dump(pending, f, ensure_ascii=False)
+        except Exception as e:
+            log_local("写 update_pending 失败: %s" % e)
 
     report_result(task_id, "progress", "即将重启替换 Agent %s ..." % version, 85)
     if task_cancelled(task_id):
@@ -1783,27 +2118,22 @@ def self_update(task):
 
 def finish_pending_update():
     pending = {}
-    if os.path.exists(PENDING_FILE):
-        try:
-            with open(PENDING_FILE, "r", encoding="utf-8") as f:
-                pending = json.load(f) or {}
-        except Exception:
-            pending = {}
+    for p in iter_update_paths("update_pending.json"):
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    pending = json.load(f) or {}
+            except Exception:
+                pending = {}
+            break
     task_id = pending.get("task_id") or str(time.time())
     try:
-        if os.path.exists(FAIL_FLAG):
+        if any_update_marker("update_fail.flag"):
             report_result(task_id, "error", "升级失败，已尝试回滚（当前版本 %s）" % AGENT_VERSION)
             log_local("升级失败回滚，当前 %s" % AGENT_VERSION)
-            try:
-                os.remove(FAIL_FLAG)
-            except Exception:
-                pass
-            try:
-                os.remove(PENDING_FILE)
-            except Exception:
-                pass
+            remove_update_markers("update_fail.flag", "update_pending.json")
             return True
-        upgraded = os.path.exists(OK_FLAG) or (
+        upgraded = any_update_marker("update_ok.flag") or (
             pending.get("version") == AGENT_VERSION
             and pending.get("from")
             and pending.get("from") != AGENT_VERSION
@@ -1818,12 +2148,7 @@ def finish_pending_update():
                 extra={"version": AGENT_VERSION},
             )
             log_local("升级完成 %s" % AGENT_VERSION)
-            for p in (OK_FLAG, PENDING_FILE):
-                try:
-                    if os.path.exists(p):
-                        os.remove(p)
-                except Exception:
-                    pass
+            remove_update_markers("update_ok.flag", "update_pending.json")
             return True
     except Exception as e:
         log_local("处理升级结果失败: %s" % e)
@@ -1833,7 +2158,11 @@ def finish_pending_update():
 def retry_pending_update():
     for delay in (2, 5, 10):
         time.sleep(delay)
-        if not os.path.exists(PENDING_FILE) and not os.path.exists(OK_FLAG) and not os.path.exists(FAIL_FLAG):
+        if (
+            not any_update_marker("update_pending.json")
+            and not any_update_marker("update_ok.flag")
+            and not any_update_marker("update_fail.flag")
+        ):
             return
         if finish_pending_update():
             return
@@ -1963,6 +2292,573 @@ def do_fetch_logs(task):
 
 
 # ===============================
+# MFT 搜索 / 指定文件回传
+# ===============================
+MFT_CACHE_TTL = 600
+COLLECT_MAX_BYTES = 80 * 1024 * 1024
+_DRIVE_RE = re.compile(r"^[A-Za-z]:$")
+_LOCAL_ABS_RE = re.compile(r"^[A-Za-z]:\\")
+_mft_cache = {}
+_mft_cache_lock = threading.Lock()
+
+
+def normalize_search_drive(drive):
+    d = (drive or "").strip().upper().replace("/", "\\").rstrip("\\")
+    if len(d) == 1 and d.isalpha():
+        d += ":"
+    if _DRIVE_RE.match(d):
+        return d
+    return ""
+
+
+def list_local_drives():
+    out = []
+    try:
+        k32 = ctypes.windll.kernel32
+        mask = int(k32.GetLogicalDrives())
+        get_type = k32.GetDriveTypeW
+    except Exception:
+        return ["D:"] if os.path.isdir("D:\\") else (["C:"] if os.path.isdir("C:\\") else [])
+    for i in range(26):
+        if not (mask & (1 << i)):
+            continue
+        letter = chr(ord("A") + i)
+        if letter in ("A", "B"):
+            continue
+        try:
+            dtype = int(get_type(letter + ":\\"))
+        except Exception:
+            continue
+        if dtype in (2, 3):
+            out.append(letter + ":")
+    return out
+
+
+def parse_search_drive_list(raw):
+    s = (raw or "").strip()
+    if not s:
+        return ["D:"]
+    tokens = [p.strip() for p in re.split(r"[,;\s]+", s) if p.strip()]
+    if any(t.lower() in ("all", "*", "全部") for t in tokens):
+        return list_local_drives()
+    out = []
+    for t in tokens:
+        d = normalize_search_drive(t)
+        if d and d not in out:
+            out.append(d)
+    return out
+
+
+def normalize_collect_path(path):
+    s = normalize_win_path(path)
+    if not s or s.startswith("\\\\"):
+        return ""
+    if not _LOCAL_ABS_RE.match(s):
+        return ""
+    if len(s) <= 3:
+        return ""
+    return s
+
+
+_KW_SPLIT_RE = re.compile(r"[,;\s\u3000\uff0c\u3001]+")
+
+
+def parse_search_keywords(raw, limit=20):
+    seen = set()
+    out = []
+    for part in _KW_SPLIT_RE.split(raw or ""):
+        w = part.strip().strip('"').strip("'")
+        if len(w) < 2:
+            continue
+        key = w.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(w)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def match_search_keyword(name, path, keywords):
+    blob_name = (name or "").lower()
+    blob_path = (path or "").lower()
+    for w in keywords or []:
+        n = (w or "").lower()
+        if len(n) < 2:
+            continue
+        if n in blob_name or n in blob_path:
+            return w
+    return ""
+
+
+def parse_max_hits(raw, default=200):
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        n = default
+    if n < 1:
+        n = 1
+    if n > 500:
+        n = 500
+    return n
+
+
+def abs_search_path(path, drive):
+    p = ("" if path is None else str(path)).replace("/", "\\").strip()
+    if not p:
+        return ""
+    if _LOCAL_ABS_RE.match(p):
+        return p
+    d = (drive or "C:").rstrip("\\")
+    if len(d) == 2 and d[1] == ":":
+        if p.startswith("\\"):
+            return d + p
+        return d + "\\" + p
+    return p
+
+
+def _mft_entry_hit(entry, keywords, drive="C:"):
+    try:
+        path = entry[5] if len(entry) > 5 else ""
+        name = entry[6] if len(entry) > 6 else ""
+    except Exception:
+        return None
+    path = abs_search_path(path, drive)
+    name = "" if name is None else str(name)
+    matched = match_search_keyword(name, path, keywords)
+    if not matched:
+        return None
+    try:
+        size = int(entry[7] or 0) if len(entry) > 7 else 0
+    except (TypeError, ValueError):
+        size = 0
+    is_dir = False
+    try:
+        is_dir = bool(entry[9]) if len(entry) > 9 else False
+    except Exception:
+        is_dir = False
+    return {"path": path, "name": name, "size": size, "is_dir": is_dir, "matched": matched}
+
+
+def _cached_mft_entries(drive):
+    with _mft_cache_lock:
+        item = _mft_cache.get(drive)
+        if not item:
+            return None
+        if time.time() - float(item.get("ts") or 0) >= MFT_CACHE_TTL:
+            return None
+        return item.get("entries")
+
+
+def _store_mft_entries(drive, entries):
+    with _mft_cache_lock:
+        _mft_cache[drive] = {"ts": time.time(), "entries": entries}
+
+
+_WALK_SKIP_DIRS = frozenset({
+    "$recycle.bin",
+    "system volume information",
+    "winsxs",
+    "windows.old",
+    "$windows.~bt",
+    "$windows.~ws",
+    "csc",
+})
+
+
+def search_files_walk(task_id, keyword, drive, max_hits, keywords):
+    root = drive + "\\"
+    report_result(
+        task_id,
+        "progress",
+        "当前系统不支持 MFT，正在遍历 %s（可能较慢）..." % drive,
+        10,
+    )
+    hits = []
+    truncated = False
+    scanned = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        if task_cancelled(task_id):
+            report_cancelled(task_id, "文件搜索已取消")
+            return
+        keep = []
+        for name in dirnames:
+            low = name.lower()
+            if low in _WALK_SKIP_DIRS:
+                continue
+            keep.append(name)
+        dirnames[:] = keep
+        for name in filenames:
+            scanned += 1
+            if scanned % 800 == 0 and task_cancelled(task_id):
+                report_cancelled(task_id, "文件搜索已取消")
+                return
+            if scanned % 4000 == 0:
+                pct = 10 + min(80, scanned // 2000)
+                report_result(
+                    task_id,
+                    "progress",
+                    "遍历中已看 %d 个，命中 %d" % (scanned, len(hits)),
+                    pct,
+                )
+            path = os.path.join(dirpath, name)
+            matched = match_search_keyword(name, path, keywords)
+            if not matched:
+                continue
+            size = 0
+            try:
+                size = os.path.getsize(path)
+            except Exception:
+                pass
+            hits.append({"path": path, "name": name, "size": size, "is_dir": False, "matched": matched})
+            if len(hits) >= max_hits:
+                truncated = True
+                break
+        if truncated:
+            break
+        for name in list(dirnames):
+            path = os.path.join(dirpath, name)
+            matched = match_search_keyword(name, path, keywords)
+            if not matched:
+                continue
+            hits.append({
+                "path": path,
+                "name": name,
+                "size": 0,
+                "is_dir": True,
+                "matched": matched,
+            })
+            if len(hits) >= max_hits:
+                truncated = True
+                break
+        if truncated:
+            break
+    return {"ok": True, "hits": hits, "truncated": truncated, "mode": "walk"}
+
+
+def search_files_mft(task_id, keyword, drive, max_hits, keywords, mftparser):
+    entries = _cached_mft_entries(drive)
+    used_cache = entries is not None
+    if used_cache:
+        report_result(
+            task_id,
+            "progress",
+            "使用 %s 缓存，正在按「%s」过滤..." % (drive, keyword),
+            35,
+        )
+    else:
+        report_result(task_id, "progress", "正在扫描 %s 的 MFT..." % drive, 10)
+        try:
+            entries = mftparser.ScanVolume(drive)
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": "扫描 MFT 失败: %s（需管理员启动；360 拦截时请把 Agent 目录加信任）" % e,
+            }
+        if task_cancelled(task_id):
+            report_cancelled(task_id, "文件搜索已取消")
+            return
+        _store_mft_entries(drive, entries)
+        report_result(
+            task_id,
+            "progress",
+            "已扫描 %s，共 %d 条，正在过滤..." % (drive, len(entries) if entries is not None else 0),
+            40,
+        )
+    if entries is None:
+        entries = []
+    hits = []
+    truncated = False
+    total = len(entries)
+    for i, entry in enumerate(entries):
+        if i and i % 20000 == 0:
+            if task_cancelled(task_id):
+                report_cancelled(task_id, "文件搜索已取消")
+                return
+            if total:
+                pct = 40 + int(50.0 * i / total)
+                if pct > 90:
+                    pct = 90
+                report_result(
+                    task_id,
+                    "progress",
+                    "过滤中 %d/%d，已命中 %d" % (i, total, len(hits)),
+                    pct,
+                )
+        hit = _mft_entry_hit(entry, keywords, drive)
+        if not hit:
+            continue
+        if len(hits) >= max_hits:
+            truncated = True
+            break
+        hits.append(hit)
+    if task_cancelled(task_id):
+        report_cancelled(task_id, "文件搜索已取消")
+        return
+    return {
+        "ok": True,
+        "hits": hits,
+        "truncated": truncated,
+        "mode": "mft",
+        "cached": used_cache,
+    }
+
+
+def search_files_mftpy(task_id, keyword, drive, max_hits, keywords):
+    try:
+        import mftpy
+    except Exception:
+        return {"fallback": True}
+    if not is_admin():
+        return {"ok": False, "error": "需要以管理员身份启动 Agent 才能搜索 MFT"}
+    entries = _cached_mft_entries(drive)
+    used_cache = entries is not None
+    if used_cache:
+        report_result(
+            task_id,
+            "progress",
+            "使用 %s 缓存，正在按「%s」过滤..." % (drive, keyword),
+            35,
+        )
+    else:
+        report_result(task_id, "progress", "正在扫描 %s 的 MFT（Win7 纯 Python）..." % drive, 15)
+        try:
+            entries = mftpy.scan_volume(drive, cancel_check=lambda: task_cancelled(task_id))
+        except mftpy.ScanCancelled:
+            report_cancelled(task_id, "文件搜索已取消")
+            return None
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": "扫描 MFT 失败: %s（需管理员启动；360 拦截读盘时请把 Agent 目录加信任）" % e,
+            }
+        if task_cancelled(task_id):
+            report_cancelled(task_id, "文件搜索已取消")
+            return None
+        _store_mft_entries(drive, entries)
+        report_result(
+            task_id,
+            "progress",
+            "已扫描 %s，共 %d 条，正在过滤..." % (drive, len(entries) if entries is not None else 0),
+            40,
+        )
+    if entries is None:
+        entries = []
+    hits = []
+    truncated = False
+    total = len(entries)
+    for i, entry in enumerate(entries):
+        if i and i % 20000 == 0:
+            if task_cancelled(task_id):
+                report_cancelled(task_id, "文件搜索已取消")
+                return None
+            if total:
+                pct = 40 + int(50.0 * i / total)
+                if pct > 90:
+                    pct = 90
+                report_result(
+                    task_id,
+                    "progress",
+                    "过滤中 %d/%d，已命中 %d" % (i, total, len(hits)),
+                    pct,
+                )
+        if not isinstance(entry, dict):
+            hit = _mft_entry_hit(entry, keywords, drive)
+            if not hit:
+                continue
+        else:
+            path = abs_search_path(entry.get("path") or "", drive)
+            name = str(entry.get("name") or "")
+            matched = match_search_keyword(name, path, keywords)
+            if not matched:
+                continue
+            try:
+                size = int(entry.get("size") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            hit = {
+                "path": path,
+                "name": name,
+                "size": size,
+                "is_dir": bool(entry.get("is_dir")),
+                "matched": matched,
+            }
+        hits.append(hit)
+        if len(hits) >= max_hits:
+            truncated = True
+            break
+    if task_cancelled(task_id):
+        report_cancelled(task_id, "文件搜索已取消")
+        return None
+    return {
+        "ok": True,
+        "hits": hits,
+        "truncated": truncated,
+        "mode": "mft_win7",
+        "cached": used_cache,
+    }
+
+
+def search_one_drive(task_id, keyword, drive, max_hits, keywords, mftparser):
+    if mftparser is not None:
+        return search_files_mft(task_id, keyword, drive, max_hits, keywords, mftparser)
+    one = search_files_mftpy(task_id, keyword, drive, max_hits, keywords)
+    if one and one.get("fallback"):
+        return search_files_walk(task_id, keyword, drive, max_hits, keywords)
+    return one
+
+
+def search_files(task):
+    task_id = task.get("task_id", str(time.time()))
+    keywords = parse_search_keywords(task.get("keyword") or "")
+    if not keywords:
+        report_result(task_id, "error", "请填写关键字，多个用逗号或空格分隔，每个至少 2 个字符")
+        return
+    keyword = ",".join(keywords)
+    raw_drive = (task.get("drive") or "").strip()
+    drives = parse_search_drive_list(raw_drive)
+    if not drives:
+        report_result(task_id, "error", "未找到可搜索的本地磁盘")
+        return
+    tokens = [p.strip() for p in re.split(r"[,;\s]+", raw_drive) if p.strip()]
+    if any(t.lower() in ("all", "*", "全部") for t in tokens):
+        drive_label = "全部(%s)" % ",".join(drives)
+    else:
+        drive_label = ",".join(drives)
+    max_hits = parse_max_hits(task.get("max_hits"), 200)
+    if task_cancelled(task_id):
+        report_cancelled(task_id, "文件搜索已取消")
+        return
+    mftparser = None
+    if can_use_mft_search():
+        if not is_admin():
+            report_result(task_id, "error", "需要以管理员身份启动 Agent 才能搜索 MFT")
+            return
+        try:
+            import mftparser as mftparser_mod
+            mftparser = mftparser_mod
+        except Exception:
+            report_result(task_id, "error", "当前包未内置 mftparser")
+            return
+    all_hits = []
+    truncated = False
+    errors = []
+    cached_any = False
+    total = len(drives)
+    for idx, drive in enumerate(drives):
+        remain = max_hits - len(all_hits)
+        if remain <= 0:
+            truncated = True
+            break
+        if task_cancelled(task_id):
+            report_cancelled(task_id, "文件搜索已取消")
+            return
+        report_result(
+            task_id,
+            "progress",
+            "正在搜索 %s（%d/%d）..." % (drive, idx + 1, total),
+            5 + int(85 * idx / max(1, total)),
+        )
+        one = search_one_drive(task_id, keyword, drive, remain, keywords, mftparser)
+        if one is None:
+            return
+        if not one.get("ok"):
+            errors.append("%s %s" % (drive, one.get("error") or "失败"))
+            continue
+        all_hits.extend(one.get("hits") or [])
+        if one.get("truncated"):
+            truncated = True
+        if one.get("cached"):
+            cached_any = True
+    if not all_hits and errors and len(errors) >= total:
+        report_result(task_id, "error", "；".join(errors))
+        return
+    if truncated:
+        msg = "「%s」在 %s 命中超过 %d 条，仅返回前 %d 条" % (keyword, drive_label, max_hits, max_hits)
+    else:
+        msg = "「%s」在 %s 命中 %d 条" % (keyword, drive_label, len(all_hits))
+    if cached_any:
+        msg += "（缓存）"
+    if errors:
+        msg += "；部分盘失败: " + "；".join(errors)
+    extra = {
+        "hits": all_hits[:max_hits],
+        "hit_count": min(len(all_hits), max_hits),
+        "truncated": truncated or len(all_hits) > max_hits,
+        "keyword": keyword,
+        "drive": drive_label,
+        "search_mode": "multi" if total > 1 else "mft",
+    }
+    report_result(task_id, "success", msg, 100, extra=extra)
+
+
+def collect_file(task):
+    task_id = task.get("task_id", str(time.time()))
+    path = normalize_collect_path(task.get("path") or task.get("collect_path") or "")
+    if not path:
+        report_result(task_id, "error", "路径无效：只接受本地盘绝对路径（如 D:\\TE\\a.txt），拒绝 UNC 和盘符根")
+        return
+    if task_cancelled(task_id):
+        report_cancelled(task_id, "文件回传已取消")
+        return
+    if os.path.isdir(path):
+        report_result(task_id, "error", "不能回传目录: %s" % path)
+        return
+    if not os.path.isfile(path):
+        report_result(task_id, "error", "文件不存在: %s" % path)
+        return
+    try:
+        size = os.path.getsize(path)
+    except Exception as e:
+        report_result(task_id, "error", "无法读取文件大小: %s" % e)
+        return
+    if size > COLLECT_MAX_BYTES:
+        report_result(
+            task_id,
+            "error",
+            "文件过大 %s，上限 %s: %s" % (format_size(size), format_size(COLLECT_MAX_BYTES), path),
+        )
+        return
+    name = os.path.basename(path)
+    report_result(task_id, "progress", "正在回传 %s（%s）..." % (name, format_size(size)), 20)
+    if task_cancelled(task_id):
+        report_cancelled(task_id, "文件回传已取消")
+        return
+    try:
+        with open(path, "rb") as f:
+            resp = session.post(
+                CONTROL_SERVER + "/agent/file",
+                data={
+                    "task_id": task_id,
+                    "machine": MACHINE_NAME,
+                    "path": path,
+                    "name": name,
+                },
+                files={"file": (name, f, "application/octet-stream")},
+                timeout=180,
+            )
+    except Exception as e:
+        report_result(task_id, "error", "文件上传失败: %s" % e)
+        return
+    data = {}
+    try:
+        data = resp.json() or {}
+    except Exception:
+        data = {}
+    if resp.status_code != 200 or not data.get("ok"):
+        report_result(task_id, "error", data.get("error") or ("文件上传失败 HTTP %s" % resp.status_code))
+        return
+    extra = {
+        "file_url": data.get("file_url") or "",
+        "file_name": data.get("file_name") or name,
+        "file_size": data.get("file_size") if data.get("file_size") is not None else size,
+        "collect_path": path,
+    }
+    report_result(task_id, "success", "已回传 %s（%s）" % (name, format_size(size)), 100, extra=extra)
+
+
+# ===============================
 # 执行任务
 # ===============================
 def run_task(task):
@@ -1995,6 +2891,10 @@ def run_task(task):
             self_update(task)
         elif action == "screenshot":
             do_screenshot(task)
+        elif action == "search_files":
+            search_files(task)
+        elif action == "collect_file":
+            collect_file(task)
         else:
             report_result(task_id, "error", "未知任务类型: %s" % action)
     except Exception as e:
@@ -2029,13 +2929,14 @@ def agent_loop():
         try:
             LOCAL_IP = get_local_ip()
             busy_flag = "1" if _busy.is_set() else "0"
-            url = "%s/task?machine=%s&ip=%s&ver=%s&agent_id=%s&busy=%s" % (
+            url = "%s/task?machine=%s&ip=%s&ver=%s&agent_id=%s&busy=%s&os=%s" % (
                 CONTROL_SERVER,
                 quote(MACHINE_NAME),
                 quote(LOCAL_IP),
                 quote(AGENT_VERSION),
                 quote(AGENT_ID),
                 busy_flag,
+                quote(windows_os_tag()),
             )
             resp = session.get(url, timeout=8)
             if resp.status_code == 200:
@@ -2161,6 +3062,7 @@ def run_tray():
 
 
 if __name__ == "__main__":
+    ensure_elevated_logon_task()
     log_local("启动 Agent %s 机台=%s 服务器=%s IP=%s" % (AGENT_VERSION, MACHINE_NAME, CONTROL_SERVER, LOCAL_IP))
     print("[*] Agent %s 已启动，机器名 %s ，控制端 %s" % (AGENT_VERSION, MACHINE_NAME, CONTROL_SERVER))
     finish_pending_update()

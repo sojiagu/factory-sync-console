@@ -1,0 +1,6 @@
+# 机台 Agent · Win7（64 位 Python 3.8）
+requests
+urllib3
+pystray
+pillow<11
+pyinstaller>=5.13,<6.12
