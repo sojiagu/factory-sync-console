@@ -6,6 +6,10 @@
 
 当前 Agent 版本：**2.0.7**。控制端默认监听 `0.0.0.0:5000`。
 
+## 管理界面
+
+![管理界面](管理界面.png)
+
 ## 下载成品
 
 打包好的安装包和升级包在 [GitHub Releases](https://github.com/sojiagu/factory-sync-console/releases/latest)，不必自己从源码构建。
