@@ -6,6 +6,18 @@
 
 当前 Agent 版本：**2.0.7**。控制端默认监听 `0.0.0.0:5000`。
 
+## 下载成品
+
+打包好的安装包和升级包在 [GitHub Releases](https://github.com/sojiagu/factory-sync-console/releases/latest)，不必自己从源码构建。
+
+| 文件 | 用途 |
+| --- | --- |
+| `factory-sync-console.zip` | 控制端，解压后运行 `工厂同步控制台.exe` |
+| `agent_2.0.7.zip` | 网页升级包，上传到控制台后推送 |
+| `agent_Setup_*.exe` | 机台手工安装包 |
+
+校验和见 Release 里的 `SHA256SUMS.txt`。
+
 ---
 
 ## 它做什么
