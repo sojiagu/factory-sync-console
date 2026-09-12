@@ -141,7 +141,7 @@ def dashboard():
                 </select><br/><br/>
 
                 <label>源路径 (共享路径或命令):</label>
-                <input type="text" name="source" style="width:300px;" placeholder="\\\\192.168.36.248\\test\\ATA"><br/><br/>
+                <input type="text" name="source" style="width:300px;" placeholder="\\\\127.0.0.1\\test\\ATA"><br/><br/>
 
                 <label>目标路径:</label>
                 <input type="text" name="destination" style="width:300px;" placeholder="D:\\TE"><br/><br/>

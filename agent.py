@@ -41,7 +41,7 @@ from PIL import Image, ImageDraw
 # 版本与默认配置
 # ===============================
 AGENT_VERSION = "2.0.7"
-DEFAULT_SERVER = "http://192.168.36.248:5000"
+DEFAULT_SERVER = "http://127.0.0.1:5000"
 DEFAULT_MACHINE_NAME = "T1-DL-0"
 MACHINE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*-[A-Za-z][A-Za-z0-9]*-[0-9]+$")
 REPORT_ENDPOINT = "/report"
@@ -57,7 +57,7 @@ CREATE_NEW_PROCESS_GROUP = 0x00000200
 if getattr(sys, "frozen", False):
     BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
 else:
-    BASE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
+BASE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 os.makedirs(BASE_DIR, exist_ok=True)
 
 DEVICE_INI = os.path.join(BASE_DIR, "device.ini")
@@ -388,8 +388,8 @@ def load_ini():
         except Exception:
             try:
                 cfg.read(DEVICE_INI)
-            except Exception:
-                pass
+        except Exception:
+            pass
     return cfg
 
 
@@ -414,7 +414,7 @@ def valid_machine_name(name):
 
 def ask_machine_name(prev="", err=""):
     root = tk.Tk()
-    root.withdraw()
+    root.withdraw()  
     apply_window_icon(root)
     result = {"val": None, "cancelled": True}
 
@@ -506,7 +506,7 @@ def get_local_ip(server=None):
             raw = CONTROL_SERVER
         except NameError:
             raw = DEFAULT_SERVER
-    host = urlparse(raw).hostname or "192.168.36.248"
+    host = urlparse(raw).hostname or "127.0.0.1"
     port = urlparse(raw).port or 80
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -832,16 +832,16 @@ LOCAL_IP = get_local_ip()
 # ===============================
 def report_result(task_id, status, message, progress=None, extra=None):
     global _progress_posting
-    data = {
-        "task_id": task_id,
-        "machine": MACHINE_NAME,
-        "status": status,
-        "message": message,
+        data = {
+            "task_id": task_id,
+            "machine": MACHINE_NAME,
+            "status": status,
+            "message": message,
         "ip": LOCAL_IP,
         "version": AGENT_VERSION,
-    }
-    if progress is not None:
-        data["progress"] = progress
+        }
+        if progress is not None:
+            data["progress"] = progress
     if extra:
         data.update(extra)
     if status == "progress":
@@ -851,7 +851,7 @@ def report_result(task_id, status, message, progress=None, extra=None):
             _progress_posting = True
         try:
             report_session.post(CONTROL_SERVER + REPORT_ENDPOINT, json=data, timeout=1.5)
-        except Exception as e:
+    except Exception as e:
             log_local("回传失败: %s" % e)
         finally:
             with _progress_post_lock:
@@ -1040,14 +1040,14 @@ def dest_tree_bytes(path):
     total = 0
     nfiles = 0
     try:
-        for root, dirs, files in os.walk(path):
+    for root, dirs, files in os.walk(path):
             for name in files:
                 p = os.path.join(root, name)
-                try:
+            try:
                     total += os.path.getsize(p)
                     nfiles += 1
-                except Exception:
-                    pass
+            except Exception:
+                pass
     except Exception:
         pass
     return total, nfiles
@@ -1291,7 +1291,7 @@ def run_robocopy_file(task_id, src, dst_dir, file_name, progress=None):
         return "cancelled"
     try:
         proc = start_robocopy(cmd)
-    except Exception as e:
+                    except Exception as e:
         log_local("robocopy 启动失败: %s" % e)
         return "fallback"
     global _current_proc
@@ -1489,21 +1489,21 @@ def copy_file_auto(task_id, src, dst, progress=None):
 
 
 def cleanup_mirror_extras(src, dst):
-    for root, dirs, files in os.walk(dst, topdown=False):
-        rel_path = os.path.relpath(root, dst)
-        src_dir = os.path.join(src, rel_path)
-        for f in files:
-            dst_file = os.path.join(root, f)
+                for root, dirs, files in os.walk(dst, topdown=False):
+                    rel_path = os.path.relpath(root, dst)
+                    src_dir = os.path.join(src, rel_path)
+                    for f in files:
+                        dst_file = os.path.join(root, f)
             if not os.path.exists(os.path.join(src_dir, f)):
-                try:
-                    os.remove(dst_file)
+                            try:
+                                os.remove(dst_file)
                 except Exception:
                     pass
-        for d in dirs:
-            dst_subdir = os.path.join(root, d)
+                    for d in dirs:
+                        dst_subdir = os.path.join(root, d)
             if not os.path.exists(os.path.join(src_dir, d)):
-                try:
-                    shutil.rmtree(dst_subdir)
+                            try:
+                                shutil.rmtree(dst_subdir)
                 except Exception:
                     pass
 
@@ -1534,7 +1534,7 @@ def copy_single_file(task_id, src, dst_dir, dest_name=None):
     start = time.time()
     try:
         rc = copy_file_auto(task_id, src, dest_file, progress)
-    except Exception as e:
+                            except Exception as e:
         progress.close()
         report_result(task_id, "error", "复制失败: %s" % e)
         return
@@ -2177,7 +2177,7 @@ def capture_screen_jpeg(out_path, live=False):
     height = int(user32.GetSystemMetrics(79))
     if width > 0 and height > 0:
         img = ImageGrab.grab(bbox=(left, top, left + width, top + height))
-    else:
+        else:
         img = ImageGrab.grab()
     if img.mode != "RGB":
         img = img.convert("RGB")

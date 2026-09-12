@@ -216,7 +216,7 @@ NSIS\makensis.exe SetupScripts\runtime\setup.nsi
 | `agent.py` | `AGENT_VERSION` | 与升级包版本一致才推送 |
 | `agent.py` | `DEFAULT_SERVER` | 未写 `device.ini` 时的控制端 |
 
-仓库里的 IP、共享账号是原厂局域网默认值，换环境请改掉。
+仓库默认控制端为 `127.0.0.1`，公盘示例为 `\\127.0.0.1\test`。换到现场时改成实际地址和账号。
 
 ---
 

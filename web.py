@@ -69,14 +69,14 @@ LOCAL_ABS_RE = re.compile(r"^[A-Za-z]:\\")
 WEB_LOG_KEEP_DAYS = 90
 ONLINE_THRESHOLD = 20
 MAX_RESULTS = 2000
-CONTROL_PUBLIC_HOST = "192.168.36.248"
+CONTROL_PUBLIC_HOST = "127.0.0.1"
 STALE_AFTER_OFFLINE = 10
 # 升级就地替换 Agent 所在目录（安装包默认 %LOCALAPPDATA%\agent）
 _audit_lock = threading.Lock()
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
 # 公盘浏览根目录（网页端用账号访问列目录）
-SHARE_ROOT = r"\\192.168.36.248\test"
+SHARE_ROOT = r"\\127.0.0.1\test"
 SHARE_USER = "1"
 SHARE_PASS = "1"
 _share_lock = threading.Lock()
